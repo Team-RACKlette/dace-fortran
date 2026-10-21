@@ -40,13 +40,16 @@ NOTE on nanobind bindings:
 
 from __future__ import annotations
 
+import os
 import ast
+import builtins
+import functools
 import gc
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
-from dace import SDFG, InterstateEdge, SDFGState, config
+from dace import SDFG, InterstateEdge, SDFGState, config, symbolic
 from dace.data import Data
 from dace.frontend.python import astutils
 from dace.properties import CodeBlock
@@ -92,6 +95,7 @@ from dace_fortran.builder.emit_tasklet import add_whole_array_fill, emit_scalar_
 from dace_fortran.builder.records import NodeLike, VarLike
 from dace_fortran.dace_types import connectors
 from dace_fortran.entry_names import split_qualified_entry
+from dace_fortran.symbol_use_sites import find_symbol_use_sites
 
 # Default bridge pass pipeline.  Order matters  --  see ``README.md``.
 DEFAULT_PIPELINE = (
@@ -127,6 +131,11 @@ DEFAULT_PIPELINE = (
     # a plain CFG that lift-cf-to-scf turns back into nested scf.if for
     # the bridge to consume.
     "lower-fir-select-case,"
+    # Bake the configuration values the caller fixed (``specialized_globals``) into the code that reads them, fold
+    # the branches they decide and drop what only a dead branch called -- before the inliner and the passes after
+    # it see code the configuration never runs.  A no-op when nothing is specialised.
+    "hlfir-specialize-globals,"
+    "symbol-dce,"
     # Structurize callees BEFORE inlining: an early ``RETURN`` (``if (c)
     # return``) or other in-callee CFG makes the callee a multi-block
     # function, and ``mlir::inlineCall`` then splices those blocks into the
@@ -136,6 +145,10 @@ DEFAULT_PIPELINE = (
     # single-block ``scf.if`` so every callee is single-block and inlines
     # cleanly; the trailing lift-cf-to-scf handles whatever inlining exposes.
     "lift-cf-to-scf,"
+    # A DO with a CYCLE (or any branch out of structured control flow in its body) is lowered unstructured and
+    # lifted to a trip-counted scf.while; restore the counted fir.do_loop so the loop and everything nested in it
+    # can become maps.
+    "hlfir-restore-counted-loops,"
     # Delete every ``CALL errore(...)`` / ``CALL finish(...)`` site
     # BEFORE the inliner runs.  These helpers are universally
     # ``IF (ierr <= 0) RETURN`` + ``WRITE`` + ``STOP 1`` -- their error
@@ -169,6 +182,9 @@ DEFAULT_PIPELINE = (
     # See ``passes/StripCharacterRuntime.cpp``.
     "hlfir-strip-character-runtime,"
     "hlfir-inline-all,"
+    # Specialise again: a configuration value passed to a callee's ``intent(in)`` dummy (a halo routine's
+    # ``halo_bounds``, a solver's ``bounds(1)``) is a plain load of the module variable only now.
+    "hlfir-specialize-globals,"
     # Unwrap ``hlfir.eval_in_mem`` blocks into ``fir.alloca`` + body +
     # reads.  flang's HLFIR wraps any array-valued expression that
     # has to be evaluated into pre-allocated memory in eval_in_mem;
@@ -197,6 +213,18 @@ DEFAULT_PIPELINE = (
     # carries an ``hlfir.elemental_addr`` (Fortran ``d(cols) = source``)
     # into an explicit DO loop of per-element scalar assigns.
     "hlfir-expand-vector-subscript-scatter,"
+    # Build every array constructor in a named local array: flang fills a
+    # heap ``.tmp.arrayctor`` either with inline element stores or, when an
+    # item is array-valued (``u = [s, s*w(1:3), t]``), through the Fortran
+    # runtime (``_FortranAPushArrayConstructor*``), whose writes the bridge
+    # cannot see.  After the gather expansion, which turns every elemental
+    # item into a named local array.
+    "hlfir-materialise-array-constructors,"
+    # An implied-do item fills its constructor at positions kept in an
+    # anonymous counter, which flang advances BEFORE the element store that
+    # uses the old position.  Move such stores below the uses of the value
+    # they overwrite, so a load names what the memory still holds.
+    "hlfir-sink-scalar-stores,"
     # Drop private callee bodies once inlined  --  otherwise their
     # declares leak into extract_vars as stray scalars.
     "symbol-dce,"
@@ -330,6 +358,7 @@ DEFAULT_PIPELINE = (
     "hlfir-default-intent,"
     # Lift cf.br / cf.cond_br loops into scf.while so extract_ast can walk them.
     "lift-cf-to-scf,"
+    "hlfir-restore-counted-loops,"
     # Classify ``fir.global`` ops as INPUT vs MUTABLE based on whether
     # the IR writes them.  INPUT globals (no in-IR writes -- the caller
     # mutates them from OUTSIDE via the bindings layer) have their
@@ -385,8 +414,15 @@ MULTI_FILE_PIPELINE = (
     # call tree in its existing fixed-point loop.  This is the
     # ``WP-2`` fix; the LU numerical correctness test passes
     # element-wise against the gfortran reference after this lands.
+    # Bake the configuration values the caller fixed (``specialized_globals``) into the code that reads them, fold
+    # the branches they decide and drop what only a dead branch called -- before the inliner and the passes after
+    # it see code the configuration never runs.  A no-op when nothing is specialised.
+    "hlfir-specialize-globals,"
+    "symbol-dce,"
     "lift-cf-to-scf,"
+    "hlfir-restore-counted-loops,"
     "hlfir-inline-all,"
+    "hlfir-specialize-globals,"
     "hlfir-fold-element-aliases,"
     "symbol-dce,"
     "hlfir-verify-no-unresolved-calls,"
@@ -424,12 +460,38 @@ MULTI_FILE_PIPELINE = (
 # Fortran physics-variable names, so renaming them would break
 # user-side bindings interfaces that key on the original name.
 #
+# Python's builtins are in scope as well when sympy parses a string: an
+# identifier naming a builtin callable (``iter``, ``max``, ``len``, ``type``,
+# ...) evaluates to that function instead of a ``Symbol``, and ``iter + 1``
+# (a lifted DO's counter update) fails with ``unsupported operand type(s)``.
+# Flang lower-cases every identifier, so only the lower-case builtins can
+# collide.
+#
 # The bridge renames any matching Fortran identifier to ``program_<name>``
 # at the SDFG layer; the binding emitter restores the original name on
 # the Python wrapper.
-RESERVED_DACE_NAMES = frozenset({"test", "doctest", "im", "re", "ln", "limit"})
+_PYTHON_BUILTIN_CALLABLES = frozenset(
+    name for name, value in vars(builtins).items() if callable(value) and name.islower() and not name.startswith("_")
+)
+RESERVED_DACE_NAMES = frozenset({"test", "doctest", "im", "re", "ln", "limit"}) | _PYTHON_BUILTIN_CALLABLES
 
 DACE_NAME_PREFIX = "program_"
+
+
+@functools.cache
+def misread_by_symbolic_parser(name: str) -> bool:
+    """Whether DaCe's symbolic parser reads the identifier ``name`` as anything but a symbol of that name.
+
+    It parses with SymPy's namespace in scope, so every name SymPy defines is a hazard, not only the ones listed in
+    ``RESERVED_DACE_NAMES``: a variable called ``denom`` (SymPy's ``denom()``), ``sign``, ``exp`` or ``field`` evaluates
+    to that function, class or module, and ``denom[0] > 0.0`` fails with "cannot sympify object of type function";
+    ``nan`` or ``oo`` would silently become a number.
+    """
+    try:
+        expr = symbolic.pystr_to_symbolic(f"{name} + 1")
+    except Exception:
+        return True
+    return name not in {str(s) for s in expr.free_symbols}
 
 
 def global_is_baked_constant(v: VarLike) -> bool:
@@ -554,9 +616,14 @@ def _rename_reserved_collisions(sdfg: SDFG) -> dict:
     in lockstep).  Returns ``{user_fortran_name: dace_name}`` for the
     binding emitter; empty dict when nothing collided.
     """
+    # Names the caller never sees -- transients and the symbols the SDFG assigns itself -- are renamed whenever
+    # DaCe's parser misreads them; the arguments and free symbols only when listed, as the binding and the callers of
+    # the SDFG name them.
+    free = {str(s) for s in sdfg.free_symbols}
     renames = {}
     for name in list(sdfg.arrays.keys()) + list(sdfg.symbols.keys()):
-        if name in RESERVED_DACE_NAMES:
+        internal = sdfg.arrays[name].transient if name in sdfg.arrays else name not in free
+        if name in RESERVED_DACE_NAMES or (internal and misread_by_symbolic_parser(name)):
             renames[name] = DACE_NAME_PREFIX + name
     for old, new in renames.items():
         sdfg.replace(old, new)
@@ -625,6 +692,15 @@ def _resolve_entry_symbol(module: HlfirModule, entry: str) -> str:
     )
 
 
+def _global_value_text(value: bool | float) -> str:
+    """The text ``hlfir-specialize-globals`` parses a value from: a logical as true/false, a real exactly."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return repr(value)
+    return str(int(value))
+
+
 class SDFGBuilder:
     """Walks the HLFIR ASTNode tree and emits a DaCe SDFG.
 
@@ -658,6 +734,7 @@ class SDFGBuilder:
         "object_alias_defs",
         "object_alias_flat_members",
         "object_aliases",
+        "offset_floors",
         "offset_values",
         "scalars",
         "symbols",
@@ -681,6 +758,8 @@ class SDFGBuilder:
     scalars: dict[str, VarLike]
     complex_component_aliases: dict[str, VarLike]
     offset_values: dict[str, int | str | None]
+    #: Free offset symbols with a known floor (the smallest sub-1 literal subscript): a direct call's default.
+    offset_floors: dict[str, int]
     extent_aliases: dict[str, str]
     object_aliases: dict[str, str]
     object_alias_defs: set[str]
@@ -698,6 +777,7 @@ class SDFGBuilder:
         self.write_set = None
         self.complex_component_aliases = {}
         self.offset_values = {}
+        self.offset_floors = {}
         self.extent_aliases = {}
         self.object_aliases = {}
         self.object_alias_defs = set()
@@ -707,7 +787,13 @@ class SDFGBuilder:
         self._id_counter = 0
         self.access_caches = weakref.WeakKeyDictionary()
 
-    def __init__(self, hlfir_path: str, pipeline: str = DEFAULT_PIPELINE, entry: str | None = None) -> None:
+    def __init__(
+        self,
+        hlfir_path: str,
+        pipeline: str = DEFAULT_PIPELINE,
+        entry: str | None = None,
+        specialized_globals: Mapping[str, bool | float] | None = None,
+    ) -> None:
         """Parse HLFIR, run the pass pipeline, and classify variables.
 
         If ``entry`` is set, every other ``func.func`` in the module is
@@ -715,6 +801,11 @@ class SDFGBuilder:
         them after ``hlfir-inline-all`` has flattened their bodies in.
         Needed when the source contains a module-scope callee that would
         otherwise leak dummy-arg declares into ``extract_vars``.
+
+        ``specialized_globals`` (``"module::name"`` -> value) bakes module variables the entry only reads into its code
+        before anything is inlined (``hlfir-specialize-globals``): the branches they decide fold, and what only a dead
+        branch called is never inlined.  The values must hold in every run the result serves; a binding guards them
+        (:mod:`dace_fortran.bindings.specialization`).
         """
         self.module = hb.HLFIRModule()
         if not self.module.parse_file(hlfir_path):
@@ -723,6 +814,10 @@ class SDFGBuilder:
         if entry is not None:
             entry = _resolve_entry_symbol(self.module, entry)
             self.module.set_entry_symbol(entry)
+        if specialized_globals:
+            self.module.set_specialized_globals(
+                {name: _global_value_text(v) for name, v in specialized_globals.items()}
+            )
         # Cache the (resolved, mangled) entry name so ``sdfg_name`` can name
         # the SDFG (and therefore the generated ``.so``) after the actual
         # procedure.
@@ -769,6 +864,13 @@ class SDFGBuilder:
             self.module.run_passes(pipeline)
 
         self._classify()
+
+    @property
+    def configuration_candidates(self) -> dict[str, str]:
+        """The module scalars the entry reads and never writes -- the values ``specialized_globals`` could fix --
+        ``"module::name"`` -> Fortran type (``logical(4)``, ``integer(4)``, ``real(8)``), as ``hlfir-specialize-globals``
+        found them before applying any value.  Empty when the pipeline does not run that pass."""
+        return dict(self.module.get_configuration_candidates())
 
     @classmethod
     def from_files(cls, hlfir_paths: Sequence[str], *, entry: str, pipeline: str = MULTI_FILE_PIPELINE) -> SDFGBuilder:
@@ -1045,6 +1147,7 @@ class SDFGBuilder:
         # ``specialize_symbols`` substitutes them as literal integers in
         # every subset.
         sdfg._fortran_offset_values = dict(const_offsets)
+        sdfg._fortran_offset_floors = dict(self.offset_floors)
         # Before any symbol substitution: ``specialize_symbols`` parses every subset it rewrites, so a leaked ``?``
         # surfaces there as a bare ``SyntaxError: invalid syntax (<unknown>, line 1)`` with no indication of which
         # edge or which Fortran construct produced it.  Check first and name the site.
@@ -1107,6 +1210,18 @@ class SDFGBuilder:
             f for e in (_plan_raw.get("entries") or []) for f in (e.get("recipe", {}).get("flat_names") or [])
         }
         prune_unused_arrays(sdfg, binding_names=_binding_keep)
+        # A section view's extent the bridge could not trace is a placeholder symbol nothing outside the SDFG can
+        # supply: define it from the section the view is linked to, before the snapshot lists it as an input.
+        from dace_fortran.builder.view_extents import define_section_view_extents
+
+        define_section_view_extents(
+            sdfg,
+            {
+                name: (v.view_source, list(v.view_subset))
+                for name, v in self.arrays.items()
+                if v.role == "view_alias" and list(v.view_subset) != [""] and name not in self.complex_component_aliases
+            },
+        )
         self._attach_frozen_signature(sdfg)
         # Stash the pre-flatten caller interface + the post-flatten plan so
         # the binding emitter can auto-derive both an ``OriginalInterface``
@@ -1651,6 +1766,7 @@ class SDFGBuilder:
             FrozenSignature,
             attach_to_sdfg,
             dtype_string,
+            symbol_dtypes_of,
         )
 
         # Auto-detected Fortran module-global provenance, keyed by the
@@ -1765,6 +1881,8 @@ class SDFGBuilder:
                     aos_origin_struct=v.aos_origin_struct if v is not None else "",
                     aos_member_path=v.aos_member_path if v is not None else "",
                     aos_outer_rank=int(v.aos_outer_rank) if v is not None else 0,
+                    aos_root_rank=int(v.aos_root_rank) if v is not None else 0,
+                    aos_struct_static=bool(v.aos_struct_static) if v is not None else False,
                     global_alloc_inside=bool(v.global_alloc_inside) if v is not None else False,
                     aos_struct_pointer=bool(v.aos_struct_pointer) if v is not None else False,
                     aos_member_pointer=bool(v.aos_member_pointer) if v is not None else False,
@@ -1799,6 +1917,7 @@ class SDFGBuilder:
             args=tuple(args_list),
             free_symbols=free_syms,
             module_symbol_origins=module_symbol_origins,
+            symbol_dtypes=symbol_dtypes_of(sdfg, free_syms),
         )
         attach_to_sdfg(sdfg, fs)
 
@@ -1947,10 +2066,6 @@ class SDFGBuilder:
         :raises RuntimeError: If any actually-used symbol is neither
             registered on the SDFG nor a dace-internal name.
         """
-        import re
-
-        from dace.sdfg.nodes import NestedSDFG, Tasklet
-
         unresolved = sorted(
             k for k in needed if k not in sdfg.symbols and k not in sdfg.arrays and not k.startswith("__dace")
         )
@@ -1958,36 +2073,11 @@ class SDFGBuilder:
             return
         # Find up to three representative use sites for the first symbol so
         # the user sees the exact tasklet / memlet that's referencing the
-        # bare name.  Word-boundary match to avoid substring noise (e.g. a
-        # symbol ``p_patch`` would otherwise match ``p_patch_nlev``).
+        # bare name.  A tasklet that reads the name through a wired
+        # connector is not one: only a tasklet using it with no edge behind
+        # it makes the symbol free.
         target = unresolved[0]
-        pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(target)}(?![A-Za-z0-9_])")
-        examples: list = []
-        for state in sdfg.all_states():
-            for edge in state.edges():
-                m = edge.data
-                if m is None or not m.data:
-                    continue
-                subset_str = f"{m.subset}"
-                if pat.search(subset_str):
-                    examples.append(f"memlet[{state.label}] data={m.data} subset={subset_str[:160]}")
-                    if len(examples) >= 3:
-                        break
-            if len(examples) >= 3:
-                break
-            for n in state.nodes():
-                if isinstance(n, Tasklet) and pat.search(n.code.as_string):
-                    examples.append(f"tasklet[{state.label}::{n.label}] code={n.code.as_string[:160]}")
-                    if len(examples) >= 3:
-                        break
-                if isinstance(n, NestedSDFG):
-                    for k, v in n.symbol_mapping.items():
-                        if pat.search(str(v)):
-                            examples.append(f"nsdfg[{state.label}::{n.label}] symbol_mapping[{k}]={v}")
-                            if len(examples) >= 3:
-                                break
-            if len(examples) >= 3:
-                break
+        examples = find_symbol_use_sites(sdfg, target)
         hint = (
             "Most likely cause: the bridge collapsed an unflattened struct-"
             "member access chain (e.g. ``s%X(...)%Y``) to the bare struct "
@@ -1997,6 +2087,12 @@ class SDFGBuilder:
             "member and the access chain dead-ends at the struct root."
         )
         bullet = "\n  ".join(examples) if examples else "(no use site found)"
+        dump = os.environ.get("DACE_FORTRAN_DUMP_DIR")
+        if dump:  # the SDFG as built, for a look at the use sites with their containers and nesting
+            try:
+                sdfg.save(os.path.join(dump, "unresolved_symbols.sdfg"))
+            except Exception:  # noqa: BLE001 -- the diagnosis below matters more than the dump
+                pass
         raise RuntimeError(
             f"unresolved free symbol(s) in SDFG: {unresolved[:5]}"
             f"{'' if len(unresolved) <= 5 else f' (+{len(unresolved) - 5} more)'}"

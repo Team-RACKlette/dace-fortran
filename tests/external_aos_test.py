@@ -820,3 +820,193 @@ def test_marshal_scalar_symbol_member_forwarded_by_value(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_literal_arguments_of_a_kept_call_are_their_values(tmp_path):
+    """``call ext(x, 1, -1)`` with the integers taken by reference: flang passes each literal through an adapter
+    (an alloca stored once); the call's terms are the literals, not the adapters' names."""
+    so = _build_c_so(tmp_path, "ext_lit", "void ext_lit(double* x, int d, int s){x[0] += d * s;}")
+    src = """
+module m_lit
+  use iso_c_binding
+  implicit none
+contains
+  subroutine kern(x)
+    real(c_double), intent(inout) :: x(4)
+    interface
+      subroutine ext_lit(x, d, s) bind(c, name="ext_lit")
+        import :: c_double, c_int
+        real(c_double), intent(inout) :: x(*)
+        integer(c_int), value :: d, s
+      end subroutine
+    end interface
+    call ext_lit(x, 1, -1)
+  end subroutine
+end module
+"""
+    clear_external_registry()
+    try:
+        keep_external("ext_lit", args=(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                                       Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),
+                                       Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN)), libraries=(str(so),))
+        sdfg = build_sdfg(src, tmp_path, name="kern", entry="m_lit::kern").build()
+        body = _external_call_body(sdfg)
+        assert "assoc_scalar" not in body, body
+        assert "1" in body and "-1" in body, body
+        x = np.array([3.0, 0.0, 0.0, 0.0])
+        sdfg(x=x)
+        np.testing.assert_allclose(x[0], 2.0)
+    finally:
+        clear_external_registry()
+
+
+def test_literal_arguments_by_reference_of_a_kept_call_are_their_values(tmp_path):
+    """The same with the integers taken by reference (a Fortran callee), which flang passes through an adapter."""
+    so = _build_c_so(tmp_path, "ext_ref", "void ext_ref(double* x, int* d, int* s){x[0] += *d * *s;}")
+    src = """
+module m_ref
+  use iso_c_binding
+  implicit none
+contains
+  subroutine kern(x)
+    real(c_double), intent(inout) :: x(4)
+    interface
+      subroutine ext_ref(x, d, s) bind(c, name="ext_ref")
+        import :: c_double, c_int
+        real(c_double), intent(inout) :: x(*)
+        integer(c_int), intent(in) :: d, s
+      end subroutine
+    end interface
+    call ext_ref(x, 1, -1)
+  end subroutine
+end module
+"""
+    clear_external_registry()
+    try:
+        keep_external("ext_ref", args=(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                                       Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),
+                                       Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN)), libraries=(str(so),))
+        sdfg = build_sdfg(src, tmp_path, name="kern", entry="m_ref::kern").build()
+        body = _external_call_body(sdfg)
+        assert "assoc_scalar" not in body, body
+    finally:
+        clear_external_registry()
+
+
+def test_literal_arguments_through_an_inlined_callee_are_their_values(tmp_path):
+    """``call wrap(x, 1, -1)`` where ``wrap`` hands its integer dummies to the kept call: the inlined dummies
+    re-declare the literal adapters, and the call's terms are still the literals."""
+    so = _build_c_so(tmp_path, "ext_in", "void ext_in(double* x, int* d, int* s){x[0] += *d * *s;}")
+    src = """
+module m_in
+  use iso_c_binding
+  implicit none
+  interface
+    subroutine ext_in(x, d, s) bind(c, name="ext_in")
+      import :: c_double, c_int
+      real(c_double), intent(inout) :: x(*)
+      integer(c_int), intent(in) :: d, s
+    end subroutine
+  end interface
+contains
+  subroutine wrap(x, d, s)
+    real(c_double), intent(inout) :: x(4)
+    integer(c_int), intent(in) :: d, s
+    call ext_in(x, d, s)
+  end subroutine
+  subroutine kern(x)
+    real(c_double), intent(inout) :: x(4)
+    call wrap(x, 1, -1)
+  end subroutine
+end module
+"""
+    clear_external_registry()
+    try:
+        keep_external("ext_in", args=(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                                      Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN),
+                                      Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN)), libraries=(str(so),))
+        sdfg = build_sdfg(src, tmp_path, name="kern", entry="m_in::kern").build()
+        body = _external_call_body(sdfg)
+        assert "assoc_scalar" not in body, body
+    finally:
+        clear_external_registry()
+
+
+def test_an_absent_optional_of_a_kept_call_is_a_null_pointer(tmp_path):
+    """An argument registered as ``none`` reaches the callee as a null pointer and connects nothing."""
+    so = _build_c_so(tmp_path, "ext_opt", "void ext_opt(double* x, void* o){x[0] += o ? 1.0 : 2.0;}")
+    src = """
+module m_opt
+  use iso_c_binding
+  implicit none
+contains
+  subroutine kern(x, y)
+    real(c_double), intent(inout) :: x(4)
+    real(c_double), intent(in) :: y(4)
+    interface
+      subroutine ext_opt(x, o) bind(c, name="ext_opt")
+        import :: c_double
+        real(c_double), intent(inout) :: x(*)
+        real(c_double), intent(in) :: o(*)
+      end subroutine
+    end interface
+    call ext_opt(x, y)
+  end subroutine
+end module
+"""
+    clear_external_registry()
+    try:
+        keep_external("ext_opt", args=(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                                       Arg(kind=ArgKind.NONE, intent=Intent.IN)), libraries=(str(so),))
+        sdfg = build_sdfg(src, tmp_path, name="kern", entry="m_opt::kern").build()
+        body = _external_call_body(sdfg)
+        assert "nullptr" in body and "_a1" not in body, body
+        x, y = np.array([3.0, 0.0, 0.0, 0.0]), np.zeros(4)
+        sdfg(x=x, y=y)
+        np.testing.assert_allclose(x[0], 5.0)
+    finally:
+        clear_external_registry()
+
+
+def test_an_optional_scalar_of_a_kept_call_crosses_by_address(tmp_path):
+    """An optional integer (``c_abi=POINTER``) reaches the callee as the address of its value where the call passes
+    it, and as a null pointer where the call leaves it absent (Fortran's own ABI for an optional bind(c) scalar)."""
+    so = _build_c_so(tmp_path, "ext_stage", "void ext_stage(double* x, const int* s){x[0] += s ? *s : 10;}")
+    src = """
+module m_stage
+  use iso_c_binding
+  implicit none
+contains
+  subroutine kern(x)
+    real(c_double), intent(inout) :: x(4)
+    interface
+      subroutine ext_stage(x, s) bind(c, name="ext_stage")
+        import :: c_double, c_int
+        real(c_double), intent(inout) :: x(*)
+        integer(c_int), intent(in), optional :: s
+      end subroutine
+    end interface
+    call ext_stage(x, 2)
+    call ext_stage(x)
+  end subroutine
+end module
+"""
+    clear_external_registry()
+    try:
+        keep_external("ext_stage", args=(Arg(kind=ArgKind.ARRAY, dtype="float64", intent=Intent.INOUT),
+                                         Arg(kind=ArgKind.SCALAR, dtype="int32", intent=Intent.IN,
+                                             c_abi=CAbi.POINTER)), libraries=(str(so),))
+        sdfg = build_sdfg(src, tmp_path, name="kern", entry="m_stage::kern").build()
+        x = np.array([1.0, 0.0, 0.0, 0.0])
+        sdfg(x=x)
+        np.testing.assert_allclose(x[0], 1.0 + 2 + 10)
+    finally:
+        clear_external_registry()
+
+
+def test_a_kept_call_forwards_the_values_the_sdfg_was_specialised_to():
+    from dace_fortran.external import ExternalCall
+
+    node = ExternalCall("call", c_name="f", body="f(_a0, n, m);", symbol_deps=["n", "m"])
+    node.specialize({"n": 5, "k": 2})
+    assert node.body == "f(_a0, (5), m);" and list(node.symbol_deps) == ["m"]

@@ -233,6 +233,33 @@ std::string lowerIsPresent(mlir::Value operand) {
 ///      ``i`` needs ``(lb_outer - 1)`` added so the final memlet
 ///      ``(i + lb_outer - 1) - offset_outer_d0`` collapses to
 ///      ``i - 1`` after specialise (correct for the callee's view).
+mlir::Value declaredLowerBound(hlfir::DeclareOp decl, unsigned dim) {
+  mlir::Value const shape = decl.getShape();
+  if (!shape) return {};
+  if (auto shapeShift = shape.getDefiningOp<fir::ShapeShiftOp>()) {
+    auto origins = shapeShift.getOrigins();  // a fresh vector per call
+    return dim < origins.size() ? origins[dim] : mlir::Value{};
+  }
+  if (auto shift = shape.getDefiningOp<fir::ShiftOp>()) {
+    auto origins = shift.getOrigins();
+    return dim < origins.size() ? origins[dim] : mlir::Value{};
+  }
+  return {};
+}
+
+std::string fortranIndexAt(const std::string& pos, mlir::Value lb, int depth) {
+  if (!lb) return pos;
+  if (auto c = traceConstInt(lb)) {
+    int64_t const adjust = *c - 1;
+    if (adjust > 0) return "(" + pos + " + " + std::to_string(adjust) + ")";
+    if (adjust < 0) return "(" + pos + " - " + std::to_string(-adjust) + ")";
+    return pos;
+  }
+  std::string const lbExpr = buildIndexExpr(lb, depth + 1);
+  if (lbExpr.empty() || lbExpr == "?") return "?";
+  return "(" + pos + " + " + lbExpr + " - 1)";
+}
+
 std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::Value idx, int depth) {
   std::string raw = buildIndexExpr(idx, depth);
   auto memref = dg.getMemref();
@@ -303,6 +330,16 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
         }
       }
       auto idxOps = parentDg.getIndices();
+      // A strided section ``w(lo:hi:st)``: position ``i`` of the view is base subscript ``lo + (i - 1) * st``.
+      // The start-only rebase below would read ``w(lo + i - 1)``, the contiguous elements from ``lo``.
+      auto const stride = found && cursor + 2 < idxOps.size() ? traceConstInt(idxOps[cursor + 2]) : std::nullopt;
+      if (found && cursor + 2 < idxOps.size() && (!stride || *stride != 1)) {
+        auto const lo = traceConstInt(idxOps[cursor]);
+        std::string const loExpr = lo ? std::to_string(*lo) : buildIndexExpr(idxOps[cursor], depth + 1);
+        std::string const stExpr = stride ? std::to_string(*stride) : buildIndexExpr(idxOps[cursor + 2], depth + 1);
+        if (loExpr.empty() || loExpr == "?" || stExpr.empty() || stExpr == "?") return "?";
+        return "(" + loExpr + " + (" + raw + " - 1) * " + stExpr + ")";
+      }
       if (found && cursor < idxOps.size()) {
         if (auto lo = traceConstInt(idxOps[cursor])) {
           int64_t const adjust = *lo - 1;
@@ -324,9 +361,10 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
     return raw;
   }
 
-  // Assumed-shape alias contribution: the callee's view-offset is 1
-  // (Fortran default for assumed-shape) but the resolved outer
-  // array's offset is the caller's lb.  Add ``(lb_outer - 1)`` so
+  // Inlined-callee alias contribution: the callee's subscripts are
+  // relative to its dummy's lower bound (1 by default for assumed
+  // shape; ``a(0:n)`` / ``a(0:)`` declare their own), the resolved outer
+  // array's offset is the caller's lb.  Add ``(lb_outer - lb_inner)`` so
   // the memlet form gives the right element after specialise.
   auto declOp = mlir::dyn_cast<hlfir::DeclareOp>(defOp);
   if (!declOp) return raw;
@@ -336,7 +374,16 @@ std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::V
   if (dim >= lbs.size()) return raw;
   auto const& lb = lbs[dim];
   if (!lb) return raw;
-  int64_t const adjust = *lb - 1;
+  int64_t adjust = *lb - 1;
+  if (mlir::Value const innerLb = declaredLowerBound(declOp, dim)) {
+    auto innerC = traceConstInt(innerLb);
+    if (!innerC) {
+      std::string const innerExpr = buildIndexExpr(innerLb, depth + 1);
+      if (innerExpr.empty() || innerExpr == "?") return "?";
+      return "(" + raw + " + " + std::to_string(*lb) + " - " + innerExpr + ")";
+    }
+    adjust = *lb - *innerC;
+  }
   if (adjust == 0) return raw;
   if (adjust > 0) return "(" + raw + " + " + std::to_string(adjust) + ")";
   return "(" + raw + " - " + std::to_string(-adjust) + ")";
@@ -471,6 +518,32 @@ std::string internPosSymbol(const std::string& array, const std::vector<int64_t>
 
 std::string internPosSymbol(const std::string& array, int64_t one_based_idx) {
   return internPosSymbol(array, std::vector<int64_t>{one_based_idx});
+}
+
+BoxDimsSource traceBoxDimsSource(mlir::Value box) {
+  BoxDimsSource src{box, {}};
+  for (int hop = 0; hop < limits::kTraceToDeclMax && src.array; ++hop) {
+    auto* def = src.array.getDefiningOp();
+    if (!def) break;
+    if (auto cv = mlir::dyn_cast<fir::ConvertOp>(def)) {
+      src.array = cv.getValue();
+    } else if (auto ld = mlir::dyn_cast<fir::LoadOp>(def)) {
+      src.array = ld.getMemref();
+    } else if (auto rb = mlir::dyn_cast<fir::ReboxOp>(def);
+               rb && !rb.getSlice() && (!rb.getShape() || rb.getShape().getDefiningOp<fir::ShiftOp>())) {
+      if (!src.boundsRebox) src.boundsRebox = rb;
+      src.array = rb.getBox();
+    } else {
+      break;
+    }
+  }
+  return src;
+}
+
+std::string reboxLowerBound(fir::ReboxOp rebox, unsigned dim, int d) {
+  auto shift = rebox.getShape() ? rebox.getShape().getDefiningOp<fir::ShiftOp>() : fir::ShiftOp{};
+  if (!shift) return "1";
+  return dim < shift->getNumOperands() ? buildIndexExpr(shift->getOperand(dim), d + 1) : "?";
 }
 
 std::string buildExpr(mlir::Value val, int d) {
@@ -724,20 +797,9 @@ std::string buildExpr(mlir::Value val, int d) {
     // Walk operand 0 back to the underlying ``hlfir.declare`` so we
     // can read its shape (for explicit-shape) or fall back to the
     // assumed-shape symbol form.
-    mlir::Value arrayVal = def->getOperand(0);
-    for (int hop = 0; hop < limits::kTraceToDeclMax && arrayVal; ++hop) {
-      auto* adef = arrayVal.getDefiningOp();
-      if (!adef) break;
-      if (auto cv = mlir::dyn_cast<fir::ConvertOp>(adef)) {
-        arrayVal = cv.getValue();
-        continue;
-      }
-      if (auto ld = mlir::dyn_cast<fir::LoadOp>(adef)) {
-        arrayVal = ld.getMemref();
-        continue;
-      }
-      break;
-    }
+    BoxDimsSource const src = traceBoxDimsSource(def->getOperand(0));
+    mlir::Value const arrayVal = src.array;
+    fir::ReboxOp const boundsRebox = src.boundsRebox;
     std::string arrName = traceToDecl(arrayVal);
     // ``fir.box_dims`` reads the *box* result (#1) of an
     // ``hlfir.declare``; ``traceToDecl`` keys on the addr result
@@ -768,7 +830,7 @@ std::string buildExpr(mlir::Value val, int d) {
       } else if (auto dg = mlir::dyn_cast<hlfir::DesignateOp>(adef)) {
         // A sectioned designate carries the RESULT's per-dim extents on its own
         // ``shape`` operand -- most importantly the LiftAos concat SLICE-BOX
-        // (``concat(idx, 1:d1, 1:d2, ...)`` replacing ``recv_dp(idx)%p``).  That
+        // (``concat(idx, lb1:lb1+d1-1, ...)`` replacing ``recv_dp(idx)%p``).  That
         // slice already dropped the concat's leading N dim, so its dim ``k`` is
         // the concat's dim ``k+1``; ``SIZE`` / ``UBOUND`` on it must read THIS
         // shape (yielding the rebind target's real extent, e.g. ``recv1_dp_d1``
@@ -827,6 +889,7 @@ std::string buildExpr(mlir::Value val, int d) {
     };
 
     // Lower bound (#0):
+    if (resIdx == 0 && boundsRebox) return reboxLowerBound(boundsRebox, dim, d);
     if (resIdx == 0) {
       if (shapeVal) {
         if (auto ss = mlir::dyn_cast<fir::ShapeShiftOp>(shapeVal.getDefiningOp())) {
@@ -1056,6 +1119,9 @@ std::string buildExpr(mlir::Value val, int d) {
       {"math.sinh", "sinh"},
       {"math.cosh", "cosh"},
       {"math.tanh", "tanh"},
+      {"math.asinh", "asinh"},
+      {"math.acosh", "acosh"},
+      {"math.atanh", "atanh"},
       {"math.exp", "exp"},
       {"math.log", "log"},
       {"math.log10", "log10"},
@@ -1419,7 +1485,17 @@ std::string buildExpr(mlir::Value val, int d) {
   // we mint for scf.if results already hold 0 / 1, and Python handles
   // ``0 != 0`` as False / ``1 != 0`` as True uniformly.
   if (nm == "arith.trunci" || nm == "arith.extui" || nm == "arith.extsi") {
-    if (def->getNumOperands() == 1) return buildExpr(def->getOperand(0), d + 1);
+    if (def->getNumOperands() == 1) {
+      mlir::Value const src = def->getOperand(0);
+      // A boolean widened to an integer -- what ``merge(1, 0, c)`` (``arith.select %c, 1, 0``) canonicalises to once
+      // its operands are constants -- is that integer, not the boolean: Python compares ``(i == 1) > 0`` either way,
+      // but a symbolic expression of it (an interstate condition, a loop bound) does not, and ``extsi`` makes true -1.
+      if (nm != "arith.trunci" && src.getType().isInteger(1)) {
+        std::string const b = buildBoolExpr(src, d + 1);
+        if (b != "?") return "(" + std::string(nm == "arith.extsi" ? "-1" : "1") + " if " + b + " else 0)";
+      }
+      return buildExpr(src, d + 1);
+    }
   }
 
   // ``fir.is_present``  --  Fortran's ``present(x)`` on an OPTIONAL dummy.

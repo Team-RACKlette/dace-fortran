@@ -152,6 +152,31 @@ std::string buildBoolExpr(mlir::Value val, int d);
 /// value (bare name or subscripted, per the caller's context).
 std::string logicalTruth(mlir::Value logical, int d, std::string (*render)(mlir::Value, int));
 
+/// The array a ``fir.box_dims`` queries: its box operand seen through ``fir.convert`` / ``fir.load`` and through any
+/// ``fir.rebox`` that keeps the extents (no slice, no reshape).  ``boundsRebox`` is the outermost such rebox; it sets
+/// the lower bounds the query sees (``reboxLowerBound``), the extents come from ``array``.
+/// ``hlfir-lift-aos-pointer-records`` rebases a gather-buffer slice to a pointer member's lower bounds this way.
+struct BoxDimsSource {
+  mlir::Value array;
+  fir::ReboxOp boundsRebox;
+};
+
+/// See ``BoxDimsSource``.  See expressions.cpp.
+BoxDimsSource traceBoxDimsSource(mlir::Value box);
+
+/// The lower bound of dim ``dim`` of a box a bounds-setting ``fir.rebox`` produces: its ``fir.shift`` origin, else 1.
+/// See expressions.cpp.
+std::string reboxLowerBound(fir::ReboxOp rebox, unsigned dim, int d);
+
+/// The lower bound ``decl`` declares for dim ``dim`` (its ``fir.shape_shift`` / ``fir.shift`` origin); null when the
+/// dim starts at 1 by default. See expressions.cpp.
+mlir::Value declaredLowerBound(hlfir::DeclareOp decl, unsigned dim);
+
+/// The Fortran index of the 1-based position ``pos`` (an elemental or loop iterator) in a dim whose lower bound is
+/// ``lb`` (null: 1): ``pos + lb - 1``, folded for a constant ``lb``; ``?`` when ``lb`` cannot be rendered. See
+/// expressions.cpp.
+std::string fortranIndexAt(const std::string& pos, mlir::Value lb, int depth);
+
 /// Render the dim-th index expression of an hlfir.designate, applying section/assumed-shape lower-bound rebases. See
 /// expressions.cpp.
 std::string buildDesignateIndexExpr(hlfir::DesignateOp dg, unsigned dim, mlir::Value idx, int depth);

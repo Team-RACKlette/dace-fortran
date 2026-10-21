@@ -6,13 +6,21 @@ from pathlib import Path
 
 import dace
 import pytest
+from dace.properties import CodeBlock
+from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
 
 from dace_fortran.bindings import (
     FrozenArg,
     FrozenSignature,
     SignatureDriftError,
 )
-from dace_fortran.bindings.frozen_signature import HOST_STORAGE, FrozenArgKind, ModuleOrigin, refreeze
+from dace_fortran.bindings.frozen_signature import (
+    HOST_STORAGE,
+    FrozenArgKind,
+    ModuleOrigin,
+    drop_unread_module_inputs,
+    refreeze,
+)
 
 
 def _demo_signature() -> FrozenSignature:
@@ -161,8 +169,72 @@ def test_refreeze_refuses_dropped_array():
         free_symbols=("n",),
     )
 
-    with pytest.raises(SignatureDriftError, match="only scalars and free symbols may shrink"):
+    with pytest.raises(SignatureDriftError, match="only scalars, free symbols and module variables may shrink"):
         refreeze(sdfg)
+
+
+def test_refreeze_drops_a_module_variable_the_kernel_no_longer_reads():
+    # A module scalar crosses as a one-element array; once specialised to a constant the kernel no longer takes it,
+    # and the binding stops reading it from the module -- it was never a buffer of the caller's.
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
+
+    sdfg._frozen_signature = FrozenSignature(
+        entry="compute",
+        mangled="_QPcompute",
+        args=(
+            FrozenArg(fortran_name="a", sdfg_name="a", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("n",)),
+            FrozenArg(fortran_name="g", sdfg_name="g", kind=FrozenArgKind.ARRAY, dtype="float64", rank=1, shape=("1",)),
+        ),
+        free_symbols=("n",),
+        module_symbol_origins={"g": ModuleOrigin("params", "g")},
+    )
+
+    assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a"]
+
+
+def test_drop_unread_module_inputs_keeps_the_callers_buffers():
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"),), dtype=dace.float64, transient=False)
+    for name, dtype in (("c", dace.int32), ("g", dace.float64), ("h", dace.float64)):
+        sdfg.add_array(name, shape=(1,), dtype=dtype, transient=False)
+    # A map reads g; a branch condition reads c; nothing reads h.
+    state = sdfg.add_state()
+    state.add_mapped_tasklet(
+        "scale",
+        {"i": "0:n"},
+        {"_g": dace.Memlet("g[0]")},
+        "_a = _g",
+        {"_a": dace.Memlet("a[i]")},
+        external_edges=True,
+    )
+    branch = ConditionalBlock("if_c")
+    sdfg.add_node(branch)
+    sdfg.add_edge(state, branch, dace.InterstateEdge())
+    body = ControlFlowRegion("then", sdfg=sdfg)
+    body.add_state("noop", is_start_block=True)
+    branch.add_branch(CodeBlock("c[0] > 0"), body)
+    sdfg._frozen_signature = FrozenSignature(
+        entry="compute",
+        mangled="_QPcompute",
+        args=tuple(
+            FrozenArg(fortran_name=n, sdfg_name=n, kind=FrozenArgKind.ARRAY, dtype=t, rank=1, shape=s)
+            for n, t, s in (
+                ("a", "float64", ("n",)),
+                ("c", "int32", ("1",)),
+                ("g", "float64", ("1",)),
+                ("h", "float64", ("1",)),
+            )
+        ),
+        free_symbols=("n",),
+        module_symbol_origins={name: ModuleOrigin("params", name) for name in ("c", "g", "h")},
+    )
+
+    # h is gone, and with it the binding's copy; g and c are read, a is the caller's.
+    assert drop_unread_module_inputs(sdfg) == ["h"]
+    assert [a.sdfg_name for a in refreeze(sdfg).args] == ["a", "c", "g"]
 
 
 # ----- OpenACC residency ---------------------------------------------------------
@@ -299,7 +371,10 @@ def test_verify_against_happy_path():
     fs.verify_against(sdfg)
 
 
-def test_drift_detection_arg_reordering():
+def test_arg_reordering_is_not_drift():
+    """The names are compared as sets: the live arglist is in DaCe's lexicographic order while a snapshot lists the
+    elements of a split array of records in element order (``x_2`` before ``x_10``); the C interface takes its order
+    from the compiled signature, not from either list."""
     sdfg = dace.SDFG("compute")
     sdfg.add_symbol("m", dace.int64)
     sdfg.add_symbol("n", dace.int64)
@@ -315,8 +390,17 @@ def test_drift_detection_arg_reordering():
         args=(fs.args[1], fs.args[0]),
         free_symbols=fs.free_symbols,
     )
+    swapped.verify_against(sdfg)
+
+
+def test_drift_detection_arg_renamed():
+    sdfg = dace.SDFG("compute")
+    sdfg.add_symbol("m", dace.int64)
+    sdfg.add_symbol("n", dace.int64)
+    sdfg.add_array("a", shape=(dace.symbol("n"), dace.symbol("m")), dtype=dace.float64, transient=False)
+    sdfg.add_array("c", shape=(dace.symbol("n"), dace.symbol("m")), dtype=dace.float64, transient=False)
     with pytest.raises(SignatureDriftError):
-        swapped.verify_against(sdfg)
+        _demo_signature().verify_against(sdfg)
 
 
 def test_drift_detection_dtype_change():

@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 import dace.symbolic
 from dace import InterstateEdge, Memlet, dtypes
 
-from dace_fortran.builder.access import acc, iter_view_dim_map
-from dace_fortran.builder.records import NodeLike, SyntheticNode
+from dace_fortran.builder.access import acc, resolve_section_alias
+from dace_fortran.builder.records import NodeLike, SyntheticAccess, SyntheticNode
 from dace_fortran.dace_types import input_connector, output_connector
 from dace_fortran.external import C_TYPES, Arg, ArgKind, CAbi, Intent
 
@@ -120,27 +120,61 @@ def _parse_reduce_identity(s: str) -> bool | int | float:
         raise NotImplementedError(f"unsupported reduction identity {s!r}") from None
 
 
+def whole_array_subset(builder: SDFGBuilder, ctx: Ctx, name: str) -> tuple[str, str]:
+    """The array a whole-array access of ``name`` reads or writes, and its subset there: all of ``name`` itself, or,
+    for a ``section_alias`` dummy, which has no array of its own, the slab of its source the section covers -- every
+    dimension the section keeps whole, the dropped ones at the scalars' positions (``call op(w(:, q))`` gives
+    ``w[0:4, (q) - offset_w_d1]``)."""
+    src, access = resolve_section_alias(builder, name, SyntheticAccess(array_name=name))
+    shape = ctx.sdfg.arrays[src].shape
+    exprs = access.index_exprs or [""] * len(shape)
+    subset = ", ".join(f"0:{shape[d]}" if e == "" else f"({e}) - offset_{src}_d{d}" for d, e in enumerate(exprs))
+    return src, subset
+
+
 def add_copy_node(builder: SDFGBuilder, ctx: Ctx, state: SDFGState, src_name: str, tgt_name: str) -> None:
     """Add a ``CopyLibraryNode`` copying the whole array ``src_name`` into ``tgt_name`` in ``state``. Connector
-    names come from the node class so this stays correct across libnode renames."""
+    names come from the node class so this stays correct across libnode renames. A ``section_alias`` dummy on either
+    side is the slab of its source (``whole_array_subset``).
+
+    A copy of a container onto exactly itself (``a = a``, or a record assigned from a dummy the caller
+    associated with that record, once the inlined dummy's members resolve onto the record's own) moves no data
+    and is dropped.  Any other copy writes into a fresh access node when the target's live node in ``state`` is
+    the source's or already has readers: writing into it would close a cycle through the copy or let those
+    earlier reads see the new value."""
     from dace.libraries.standard.nodes import CopyLibraryNode
 
-    src_desc = ctx.sdfg.arrays[src_name]
-    tgt_desc = ctx.sdfg.arrays[tgt_name]
+    from dace_fortran.builder.emit_tasklet import ensure_view_writeback_link
 
-    cp = CopyLibraryNode(name=f"copy_{tgt_name}_{builder.nid()}")
-    state.add_node(cp)
+    if src_name == tgt_name:
+        return
+    src_data, src_subset = whole_array_subset(builder, ctx, src_name)
+    tgt_data, tgt_subset = whole_array_subset(builder, ctx, tgt_name)
+    src_desc = ctx.sdfg.arrays[src_data]
+    tgt_desc = ctx.sdfg.arrays[tgt_data]
 
-    src_access = acc(builder, state, src_name)
-    tgt_access = acc(builder, state, tgt_name)
+    src_access = acc(builder, state, src_data)
+    src_memlet = Memlet(data=src_data, subset=src_subset)
     # An allocatable transient can carry its own symbolic ALLOCATE extent, distinct from the
     # source's; drive the dest memlet off the source's shape when they differ (same rank) so
     # both subsets align -- conformance keeps the dest subset in bounds.
     same_rank_diff_shape = len(src_desc.shape) == len(tgt_desc.shape) and list(src_desc.shape) != list(tgt_desc.shape)
     tgt_memlet = (
-        Memlet.from_array(tgt_name, src_desc) if same_rank_diff_shape else Memlet.from_array(tgt_name, tgt_desc)
+        Memlet.from_array(tgt_data, src_desc) if same_rank_diff_shape else Memlet(data=tgt_data, subset=tgt_subset)
     )
-    state.add_edge(src_access, None, cp, input_connector(CopyLibraryNode), Memlet.from_array(src_name, src_desc))
+
+    cache = builder.access_caches[state]  # ``acc`` above created it
+    live = cache.get(tgt_data)
+    if live is not None and (live is src_access or state.out_degree(live) > 0):
+        tgt_access = state.add_access(tgt_data)
+        cache[tgt_data] = tgt_access
+        ensure_view_writeback_link(builder, state, tgt_access, tgt_data)
+    else:
+        tgt_access = acc(builder, state, tgt_data)
+
+    cp = CopyLibraryNode(name=f"copy_{tgt_name}_{builder.nid()}")
+    state.add_node(cp)
+    state.add_edge(src_access, None, cp, input_connector(CopyLibraryNode), src_memlet)
     state.add_edge(cp, output_connector(CopyLibraryNode), tgt_access, None, tgt_memlet)
 
 
@@ -158,7 +192,8 @@ def _state_for_whole_write(builder: SDFGBuilder, ctx: Ctx, region: ControlFlowRe
 
 def emit_copy(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRegion) -> None:
     """Whole-array ``b = a`` -> ``CopyLibraryNode``."""
-    state = _state_for_whole_write(builder, ctx, region, n.target)
+    tgt_data, _ = whole_array_subset(builder, ctx, n.target)
+    state = _state_for_whole_write(builder, ctx, region, tgt_data)
     add_copy_node(builder, ctx, state, n.reduce_src, n.target)  # buildCopyNode stored the source in reduce_src
 
 
@@ -168,26 +203,15 @@ def emit_memset(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlow
     from dace.libraries.standard.nodes import FillLibraryNode
 
     tgt_name = n.target
-    # Section-alias dummies route memset through the source array, writing the slab
-    # view_dim_map carves out.
+    # Section-alias dummies route memset through the source array, writing the slab the section covers.
     v_tgt = builder.arrays.get(tgt_name)
     if v_tgt is not None and v_tgt.role == "section_alias":
-        src_name = v_tgt.view_source
+        src_name, slab = whole_array_subset(builder, ctx, tgt_name)
         state = _state_for_whole_write(builder, ctx, region, src_name)
-        src_desc = ctx.sdfg.arrays[src_name]
-        slab_parts = []
-        for src_dim, slot, dummy_dim in iter_view_dim_map(v_tgt.view_dim_map):
-            if dummy_dim is not None:
-                slab_parts.append(f"0:{src_desc.shape[src_dim]}")
-            else:
-                slab_parts.append(f"({slot}) - 1")
-        slab_subset = ", ".join(slab_parts)
         ms = FillLibraryNode(name=f"memset_{tgt_name}_{builder.nid()}")
         state.add_node(ms)
         tgt_access = acc(builder, state, tgt_name)  # redirects to src via resolve
-        state.add_edge(
-            ms, output_connector(FillLibraryNode), tgt_access, None, Memlet(data=src_name, subset=slab_subset)
-        )
+        state.add_edge(ms, output_connector(FillLibraryNode), tgt_access, None, Memlet(data=src_name, subset=slab))
         ctx.new_state(builder, region)
         return
 
@@ -393,9 +417,18 @@ def _emit_libcall(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFl
     effective_in_conns = list(in_conns)
     if has_mask and spec.node_cls in ("ArgMin", "ArgMax"):
         effective_in_conns.append("_mask")
-    for conn, src, sub in zip(effective_in_conns, n.call_args, arg_subsets, strict=False):
-        src_desc = ctx.sdfg.arrays[src]
-        in_memlet = Memlet(f"{src}[{sub}]") if sub else Memlet.from_array(src, src_desc)
+    in_memlets = [
+        Memlet(f"{src}[{sub}]") if sub else Memlet.from_array(src, ctx.sdfg.arrays[src])
+        for src, sub in zip(n.call_args, arg_subsets, strict=False)
+    ]
+    # DOT_PRODUCT needs conforming operands, but their lengths may differ symbolically (an allocatable's descriptor
+    # extent ``w_d0`` vs a temporary sized ``nb`` from the same variable), which Dot rejects: read both whole 1-D
+    # operands over the first one's length.
+    if spec.node_cls == "Dot" and len(in_memlets) == 2 and not any(arg_subsets[:2]):
+        x_shape, y_shape = ctx.sdfg.arrays[n.call_args[0]].shape, ctx.sdfg.arrays[n.call_args[1]].shape
+        if len(x_shape) == len(y_shape) == 1 and x_shape[0] != y_shape[0]:
+            in_memlets[1] = Memlet(f"{n.call_args[1]}[0:{x_shape[0]}]")
+    for conn, src, in_memlet in zip(effective_in_conns, n.call_args, in_memlets, strict=False):
         state.add_edge(acc(builder, state, src), None, node, conn, in_memlet)
 
     # Element-designate dest (res1(1) = dot_product(...)): narrow the output memlet to one
@@ -1524,12 +1557,14 @@ def emit_fft(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowReg
 
 
 class PlannedArg(NamedTuple):
-    """One call argument of an external call; ``group`` is the marshalled struct an AOS member belongs to."""
+    """One call argument of an external call; ``group`` is the marshalled struct an AOS member belongs to;
+    ``by_pointer``: a scalar crossing by address (an optional one: null where the call site leaves it absent)."""
 
     kind: ArgKind
     dtype: str
     intent: Intent
     group: int | None
+    by_pointer: bool = False
 
 
 class MemberSlot(NamedTuple):
@@ -1559,6 +1594,23 @@ class TermKind(Enum):
 class CallTerm(NamedTuple):
     kind: TermKind
     value: Any
+
+
+def _image_of_record_array(builder: SDFGBuilder, ctx: Ctx, name: str) -> str:
+    """The SDFG array a call argument names: itself, or, for an array of records the flattening unpacked into one
+    member image (``q_vf`` -> ``q_vf_sf``), that image, which is what the SDFG holds and the callee's shim takes."""
+    if name in ctx.sdfg.arrays or name in ctx.sdfg.symbols or not name:
+        return name
+    plan = builder.module.get_flatten_plan() or {}
+    images = sorted({f for e in plan.get("entries") or [] for f in e.get("recipe", {}).get("flat_names") or []
+                     if f.startswith(f"{name}_")})
+    # A module array of records: its member images are arrays of the SDFG already (records.py).
+    if not images:
+        images = sorted(a for a in ctx.sdfg.arrays if a.startswith(f"{name}_"))
+    print(f"kept call: {name} is no array or symbol of the SDFG; member images {images}", flush=True)
+    if len(images) != 1:
+        return name
+    return images[0]
 
 
 def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRegion) -> None:
@@ -1615,7 +1667,7 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     from collections import defaultdict
     from math import prod
 
-    names = list(n.call_args)
+    names = [_image_of_record_array(builder, ctx, name) for name in n.call_args]
     groups = list(n.aos_marshal_groups)  # flat [start, count, ...]
     group_pairs = [(groups[i], groups[i + 1]) for i in range(0, len(groups), 2)]
 
@@ -1710,7 +1762,8 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
                 plan.append(PlannedArg(ArgKind.AOS, a.dtype, a.intent, gi))
             gi += 1
         else:
-            plan.append(PlannedArg(a.kind, a.dtype, a.intent, None))
+            plan.append(PlannedArg(a.kind, a.dtype, a.intent, None,
+                                   a.kind is ArgKind.SCALAR and a.resolved_c_abi() is CAbi.POINTER))
     if len(plan) != len(names):
         raise ValueError(
             f"external {callee!r}: expanded signature expects "
@@ -1747,8 +1800,28 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     # logical-term position to ``(shape_tuple,)``.
     array_shape_at_term: dict = {}
     prev_gid = None
-    for i, (kind, _dtype, intent, gid) in enumerate(plan):
+    # A scalar crossing by address takes it from a cell of the call body holding its value.
+    scalar_cells: list[str] = []
+    for i, (kind, _dtype, intent, gid, by_pointer) in enumerate(plan):
         name = names[i]
+        if kind is ArgKind.NONE:  # an absent optional: a null pointer, nothing connected
+            logical_terms.append(CallTerm(TermKind.LITERAL, "nullptr"))
+            prev_gid = None
+            continue
+        if by_pointer:
+            prev_gid = None
+            if not name:  # absent at this call site
+                logical_terms.append(CallTerm(TermKind.LITERAL, "nullptr"))
+                continue
+            value = name
+            if name in ctx.sdfg.arrays:
+                value = f"_a{i}"
+                in_conns.append(value)
+                edges.append(CallEdge(name, value, False))
+            ctype = C_TYPES[_dtype]
+            scalar_cells.append(f"{ctype} _pv{i} = ({ctype})({value});")
+            logical_terms.append(CallTerm(TermKind.LITERAL, f"&_pv{i}"))
+            continue
         if gid is not None:
             desc = ctx.sdfg.arrays.get(name)
             if desc is None:
@@ -1861,7 +1934,7 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     #     buffer, no pack/unpack copy.  Used for sibling-SDFG callees
     #     that already speak SoA (their ``bind_c_shim`` receives the
     #     per-member slots the marshal pass produced).
-    body_lines: list = []
+    body_lines: list = list(scalar_cells)
     call_args_c: list = []
     bufname: dict = {}
     for term_index, (term_kind, val) in enumerate(logical_terms):
@@ -2032,7 +2105,7 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
     last_gid_seen = None
     last_member_idx = -1
     plan_term_index = -1  # mirrors ``logical_terms`` indexing for non-aos
-    for _kind, _dtype, _intent, gid in plan:
+    for _kind, _dtype, _intent, gid, _by_pointer in plan:
         if gid is None:
             plan_term_index += 1
             term_shape = array_shape_at_term.get(plan_term_index)
@@ -2091,6 +2164,10 @@ def emit_call(builder: SDFGBuilder, ctx: Ctx, n: NodeLike, region: ControlFlowRe
             )
         decl_types.append(f"{fwd_ct}*" if rank > 0 else fwd_ct)
     c_decl = f'extern "C" void {sig.c_name}({", ".join(decl_types) or "void"});'
+    # A function no library of the registration exports comes from the program that loads the SDFG library (a
+    # bind(c) procedure of its binding): weak, so the library loads on its own, as the build does to read it.
+    if not sig.libraries:
+        c_decl = f"#pragma weak {sig.c_name}\n{c_decl}"
 
     body_text = "\n".join(body_lines)
     # Symbols the call string forwards (dynamic-member extents + lower bounds).

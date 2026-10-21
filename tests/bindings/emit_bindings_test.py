@@ -254,6 +254,41 @@ def _nested_struct(tmp_path: Path) -> str:
 # --------------------------------------------------------------------------
 
 
+def test_fold_long_lines_keeps_lines_within_the_standard_limit():
+    """A long ``use ..., only:`` list is continued after commas outside string literals; the statement is unchanged."""
+    from dace_fortran.bindings.block_builders import FORTRAN_LINE_LIMIT, fold_long_lines
+
+    renames = ", ".join(f"v{i}__mod => v{i}" for i in range(80))
+    src = f"  use m_globals, only: {renames}\n  print *, 'a, b, c'\n"
+    folded = fold_long_lines(src)
+    assert all(len(line) <= FORTRAN_LINE_LIMIT for line in folded.split("\n"))
+    assert folded.split("\n")[0].endswith(", &")
+    assert " ".join(folded.replace("&\n", " ").split()) == " ".join(src.split())
+    # A comma inside a string literal is no place to break, so a short line with one is left alone.
+    assert "  print *, 'a, b, c'" in folded.split("\n")
+
+
+def test_fold_long_lines_without_a_comma_in_reach():
+    """A statement whose first comma lies past the limit (a guard over a member of a member of an array of records)
+    is continued after an opening parenthesis or at a blank instead; the statement is unchanged."""
+    from dace_fortran.bindings.block_builders import FORTRAN_LINE_LIMIT, fold_long_lines
+
+    x = "records_with_long_names(rec_index_i0)%fields(member_index_i1)%data"
+    stmt = (
+        f"if (size({x}) > 0) call add_range(ranges, nranges, 2, storage_size({x}) / 8, "
+        f"int([loc({x}(lbound({x}, 1), lbound({x}, 2))), loc({x}(min(lbound({x}, 1) + 1, ubound({x}, 1))))], "
+        "c_intptr_t), [size(x, 1, kind=c_intptr_t)])"
+    )
+    src = f"        {stmt}\n  print *, 'no break (here)'\n"
+    folded = fold_long_lines(src)
+    lines = folded.split("\n")
+    assert all(len(line) <= FORTRAN_LINE_LIMIT for line in lines)
+    assert all(line.endswith(" &") for line in lines[: lines.index("  print *, 'no break (here)'") - 1])
+    assert " ".join(folded.replace("&\n", " ").split()).replace("( ", "(").replace("[ ", "[") == " ".join(
+        src.split()
+    )
+
+
 def test_two_real_array_struct_all_aliased(tmp_path: Path):
     """Matching layout on every member -- wrapper must not allocate scratch or emit copy loops, pointer aliasing only."""
     src = _two_real_array_struct(tmp_path)

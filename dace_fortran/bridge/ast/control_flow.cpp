@@ -114,13 +114,9 @@ std::vector<ASTNode> buildElementalAssign(hlfir::AssignOp assign, hlfir::Element
     ++pushed;
   }
 
-  // Write index = target[per-array-dim index]; section designates add (lo-1) per triplet-iter, scalar dims carry their
-  // own Fortran-1-based expr (elemental rank = triplet count, not the underlying array's rank). LowerAdj: expr
-  // non-empty -> (iter+expr-1); value!=0 -> integer offset; else bare iter.
-  struct LowerAdj {
-    int64_t value = 0;
-    std::string expr;
-  };
+  // Write index = target[per-array-dim index] as a Fortran index: the elemental's iterators are 1-based positions, so a
+  // section designate's triplet dim takes ``iter + lo - 1`` and a whole array ``iter + lb - 1`` (fortranIndexAt);
+  // scalar dims carry their own index expr (elemental rank = triplet count, not the underlying array's rank).
   AccessInfo wa;
   wa.array_name = inner.target;
   wa.is_write = true;
@@ -152,38 +148,8 @@ std::vector<ASTNode> buildElementalAssign(hlfir::AssignOp assign, hlfir::Element
       unsigned tDim = 0;
       for (bool const isT : triplets) {
         if (isT && tDim < rank && cursor + 3 <= idxOps.size()) {
-          LowerAdj adj;
-          if (auto lo = traceConstInt(idxOps[cursor])) {
-            adj.value = *lo - 1;
-          } else {
-            auto loExpr = buildIndexExpr(idxOps[cursor], 0);
-            if (!loExpr.empty() && loExpr != "?") adj.expr = std::move(loExpr);
-          }
-          std::string ix = iter_names[tDim];
-          if (!adj.expr.empty()) {
-            std::string adjusted = "(";
-            adjusted += ix;
-            adjusted += " + ";
-            adjusted += adj.expr;
-            adjusted += " - 1)";
-            ix = std::move(adjusted);
-          } else if (adj.value > 0) {
-            std::string adjusted = "(";
-            adjusted += ix;
-            adjusted += " + ";
-            adjusted += std::to_string(adj.value);
-            adjusted += ")";
-            ix = std::move(adjusted);
-          } else if (adj.value < 0) {
-            std::string adjusted = "(";
-            adjusted += ix;
-            adjusted += " - ";
-            adjusted += std::to_string(-adj.value);
-            adjusted += ")";
-            ix = std::move(adjusted);
-          }
           wa.index_vars.push_back(iter_names[tDim]);
-          wa.index_exprs.push_back(std::move(ix));
+          wa.index_exprs.push_back(fortranIndexAt(iter_names[tDim], idxOps[cursor], 0));
           cursor += 3;
           tDim++;
         } else if (!isT && cursor < idxOps.size()) {
@@ -202,10 +168,13 @@ std::vector<ASTNode> buildElementalAssign(hlfir::AssignOp assign, hlfir::Element
       }
     } else {
       // Bare hlfir.declare -- write across the elemental's full rank (every dim is a triplet covering the array's
-      // extent).
+      // extent), from each dim's declared lower bound (``qv(0:n, -2:k)``).
+      auto decl = mlir::dyn_cast<hlfir::DeclareOp>(dd);
+      bool const bounded = decl && mlir::cast<mlir::OpResult>(dest).getResultNumber() == 0;
       for (unsigned i = 0; i < rank; ++i) {
         wa.index_vars.push_back(iter_names[i]);
-        wa.index_exprs.push_back(iter_names[i]);
+        wa.index_exprs.push_back(bounded ? fortranIndexAt(iter_names[i], declaredLowerBound(decl, i), 0)
+                                         : iter_names[i]);
       }
     }
   } else {
@@ -410,11 +379,10 @@ std::vector<ASTNode> buildElementalAssign(hlfir::AssignOp assign, hlfir::Element
   }
   // Prepend any libcall-result materialisations so the transient is declared and populated before the elemental body
   // reads it.
-  if (!preNodes.empty()) {
-    preNodes.push_back(std::move(current));
-    return preNodes;
-  }
-  return {current};
+  for (auto& n :
+       evaluateBeforeAssigning(std::move(current), mlir::cast<hlfir::ExprType>(elem.getType()).getElementType()))
+    preNodes.push_back(std::move(n));
+  return preNodes;
 }
 
 /// Render an arith::cmpi predicate as a Python comparison operator; empty string for signed/unsigned variants not wired
@@ -766,7 +734,7 @@ std::string buildExprWithSubscripts(mlir::Value val, int d) {
       {"math.sin", "sin"},     {"math.cos", "cos"},     {"math.tan", "tan"},   {"math.asin", "asin"},
       {"math.acos", "acos"},   {"math.atan", "atan"},   {"math.sinh", "sinh"}, {"math.cosh", "cosh"},
       {"math.tanh", "tanh"},   {"math.floor", "floor"}, {"math.ceil", "ceil"}, {"math.round", "round"},
-      {"math.trunc", "trunc"},
+      {"math.trunc", "trunc"}, {"math.asinh", "asinh"}, {"math.acosh", "acosh"}, {"math.atanh", "atanh"},
   };
   auto unm = def->getName().getStringRef();
   if (auto it = unary_intrinsics.find(unm); it != unary_intrinsics.end() && def->getNumOperands() == 1)

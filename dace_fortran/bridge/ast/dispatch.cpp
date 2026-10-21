@@ -115,14 +115,32 @@ static void dispatchScfWhileCall(fir::CallOp call, std::vector<ASTNode>& out);
 // Forward decl: walkSCFBeforeRegion dispatches a NESTED scf.while through the same builder as a top-level one.
 static ASTNode buildWhileNode(mlir::scf::WhileOp whileOp);
 
+// The last op of `block` that `cond` depends on through SSA operands; nullptr when it depends on none (it reads only the
+// region's arguments or values from outside the loop).  The condition's value is fixed where that op runs: a load
+// reads the memory of that point, an scf.if result is what its taken branch yielded.
+static mlir::Operation* lastDependencyInBlock(mlir::Block& block, mlir::Value cond) {
+  mlir::Operation* last = nullptr;
+  llvm::SmallVector<mlir::Value, 8> work{cond};
+  llvm::DenseSet<mlir::Value> seen;
+  while (!work.empty()) {
+    mlir::Value const v = work.pop_back_val();
+    if (!seen.insert(v).second) continue;
+    mlir::Operation* def = v.getDefiningOp();
+    if (!def || def->getBlock() != &block) continue;
+    if (!last || last->isBeforeInBlock(def)) last = def;
+    for (mlir::Value const o : def->getOperands()) work.push_back(o);
+  }
+  return last;
+}
+
 std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
   std::vector<ASTNode> out;
-  // Snapshot scf.condition's break value at body START, before an in-body scf.if mutates it, into __brk_<N>; without it
-  // the break re-evaluates post-mutation values and fires one iteration early (NPB LU ssor convergence check).
+  // Snapshot scf.condition's break value into __brk_<N> right after the last op of the body it depends on, where its
+  // SSA value is computed.  Taken earlier, it reads values the body has not produced yet (an EXIT testing the body's
+  // own update, whose condition is the result of the scf.if around the body); re-evaluated at the guard, it reads
+  // values an in-body scf.if has mutated since and fires one iteration early (NPB LU ssor convergence check).
   static thread_local int kBrkCounter = 0;
   std::string brkSynthName;
-  ASTNode deferredSnap;  // break-condition snapshot deferred past the block's switch chain (see below)
-  bool haveDeferredSnap = false;
   mlir::scf::ConditionOp pendingCondOp;
   for (auto& op : block) {
     if (auto condOp = mlir::dyn_cast<mlir::scf::ConditionOp>(op)) {
@@ -130,57 +148,47 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
       break;
     }
   }
-  if (pendingCondOp) {
+  // Rendered only once every op it depends on has been walked, so an scf.if or scf.index_switch result reads as the
+  // synthetic scalar its statement lowering assigns.
+  auto pushBreakSnapshot = [&]() {
     auto condVal = pendingCondOp.getCondition();
     // Materialises SUM/MINVAL/MAXVAL/PRODUCT in the loop condition into a Reduce lib-node scalar before the
     // break-check; without it a runtime-extent DO WHILE (MAXVAL(a) > 0) falls to inline-unroll which bails to "?".
     materialiseCondReductions(condVal, out);
-    size_t const scMapBefore = kScfValueMap.size();
     auto b = buildBoolExpr(condVal, 0);
-    if (!b.empty() && b != "?") {
-      // An array-element break condition (e.g. rsdnm(i) < tolrsd(i)) can't ride an interstate-edge assignment -- DaCe
-      // strips the subscript to a bare pointer compare (see tests/lu_two_call_convergence_repro_test.py).
-      std::vector<AccessInfo> condAccesses;
-      collectReadAccesses(condVal, condAccesses, 0);
-      int const brkId = kBrkCounter++;
-      // Rendering the condition LAZILY registered a side-effecting index_switch result (kScfValueMap grew): the
-      // switch's materialising chain is emitted by the block walk BELOW, so the snapshot must be deferred to just
-      // before the guard -- pushed here it would read the synth BEFORE the switch assigned it (hpsort GOTO loops).
-      bool const deferSnap = kScfValueMap.size() != scMapBefore;
-      if (condAccesses.empty()) {
-        // Pure scalar/counter condition -- symbol snapshot is exact (no array reads to keep off the interstate edge).
-        brkSynthName = "__brk_" + std::to_string(brkId);
-        ASTNode snap;
-        snap.kind = "assign";
-        snap.target = brkSynthName;
-        snap.expr = b;
-        snap.target_is_array = false;
-        if (deferSnap) {
-          deferredSnap = std::move(snap);
-          haveDeferredSnap = true;
-        } else {
-          out.push_back(std::move(snap));
-        }
-      } else {
-        // Array-dependent break: compute into scalar transient __brkc_<N> via tasklet (array reads keep per-occurrence
-        // connectors/memlets); guard reads the bare scalar name. Scalars-over-len1 rule -- no length-1 array promotion.
-        brkSynthName = "__brkc_" + std::to_string(brkId);
-        ASTNode comp;
-        comp.kind = "assign";
-        comp.target = brkSynthName;
-        comp.expr = b;  // bare names; emit_tasklet wires the subscripts
-        comp.accesses = std::move(condAccesses);
-        comp.target_is_array = false;
-        if (deferSnap) {
-          deferredSnap = std::move(comp);
-          haveDeferredSnap = true;
-        } else {
-          out.push_back(std::move(comp));
-        }
-      }
+    if (b.empty() || b == "?") return;
+    // An array-element break condition (e.g. rsdnm(i) < tolrsd(i)) can't ride an interstate-edge assignment -- DaCe
+    // strips the subscript to a bare pointer compare (see tests/lu_two_call_convergence_repro_test.py).
+    std::vector<AccessInfo> condAccesses;
+    collectReadAccesses(condVal, condAccesses, 0);
+    int const brkId = kBrkCounter++;
+    ASTNode snap;
+    snap.kind = "assign";
+    snap.expr = b;  // bare names; emit_tasklet wires the subscripts
+    snap.target_is_array = false;
+    if (condAccesses.empty()) {
+      // Pure scalar/counter condition -- symbol snapshot is exact (no array reads to keep off the interstate edge).
+      brkSynthName = "__brk_" + std::to_string(brkId);
+    } else {
+      // Array-dependent break: compute into scalar transient __brkc_<N> via tasklet (array reads keep per-occurrence
+      // connectors/memlets); guard reads the bare scalar name. Scalars-over-len1 rule -- no length-1 array promotion.
+      brkSynthName = "__brkc_" + std::to_string(brkId);
+      snap.accesses = std::move(condAccesses);
     }
+    snap.target = brkSynthName;
+    out.push_back(std::move(snap));
+  };
+  mlir::Operation* snapshotAfter = pendingCondOp ? lastDependencyInBlock(block, pendingCondOp.getCondition()) : nullptr;
+  bool snapshotPending = static_cast<bool>(pendingCondOp);
+  if (snapshotPending && !snapshotAfter) {
+    pushBreakSnapshot();
+    snapshotPending = false;
   }
   for (auto& op : block) {
+    if (snapshotPending && snapshotAfter->isBeforeInBlock(&op)) {
+      pushBreakSnapshot();
+      snapshotPending = false;
+    }
     if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(op)) {
       if (isOptionalPresentSelect(ifOp)) continue;  // dead optional-present marshalling select
       out.push_back(buildScfIfAsConditional(ifOp));
@@ -203,12 +211,6 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
       continue;
     }
     if (auto condOp = mlir::dyn_cast<mlir::scf::ConditionOp>(op)) {
-      // A deferred break-condition snapshot lands HERE -- after the block's ops (incl. the materialising switch
-      // chain for any lazily-registered index_switch result the snapshot reads), before the guard that reads it.
-      if (haveDeferredSnap) {
-        out.push_back(std::move(deferredSnap));
-        haveDeferredSnap = false;
-      }
       // Captures the scf.while's carried results into synth scalars each iteration; a post-loop scf.index_switch reads
       // these to run the fired EXIT's side effect -- without this the exit reason is lost.
       if (auto whileOp = condOp->getParentOfType<mlir::scf::WhileOp>()) {
@@ -222,8 +224,8 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
           out.push_back(std::move(a));
         }
       }
-      // scf.condition(%c): break when %c is false. Uses the pre-body snapshot __brk_<N> (if created) so the check sees
-      // start-of-iteration values, not post-mutation ones.
+      // scf.condition(%c): break when %c is false. Reads the snapshot __brk_<N> (if created), taken where %c is
+      // computed, not values mutated since.
       ASTNode guard;
       guard.kind = "conditional";
       if (!brkSynthName.empty()) {
@@ -311,6 +313,9 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
       a.target = target;
       a.expr = expr;
       a.target_is_array = false;
+      // buildExpr renders an array-element read by its parent name and leaves the subscript to the memlet, so a
+      // scalar store (the start or trip count of a lifted DO, ``l = ib(3)%beg``) carries its element reads.
+      if (fir::isa_trivial(st.getValue().getType())) collectReadAccesses(st.getValue(), a.accesses, 0);
       out.push_back(std::move(a));
       continue;
     }
@@ -399,7 +404,6 @@ std::vector<ASTNode> walkSCFBeforeRegion(mlir::Block& block) {
                                "allowlist via ``kKnownBenign`` if the op is a pure marker.");
     }
   }
-  if (haveDeferredSnap) out.push_back(std::move(deferredSnap));  // safety net; normally pushed at the condition op
   return out;
 }
 
@@ -1694,10 +1698,10 @@ static void recognizeIoCall(fir::CallOp call, llvm::StringRef c, IoState& s, std
 
 // Block walker.
 
-/// An ALL/ANY reduction used directly as an IF condition is materialised into a boolean-scalar transient via
-/// AllNode/AnyNode (a reduce ASTNode) so the branch reads a scalar instead of a malformed multi-dim memlet from
-/// inlining the section. Pushes declare_transient+reduce, returns the scalar's name; empty for non-bare ALL/ANY (e.g.
-/// .NOT. ALL(...)).
+/// An ALL/ANY reduction used directly as an IF condition, or stored to a scalar, is materialised into a boolean-scalar
+/// transient via AllNode/AnyNode (a reduce ASTNode) so the reader sees a scalar instead of a malformed multi-dim memlet
+/// from inlining the section. Pushes declare_transient+reduce, returns the scalar's name; empty for non-bare ALL/ANY
+/// (e.g. .NOT. ALL(...)).
 static std::string tryMaterialiseAllAnyCond(mlir::Value condVal, std::vector<ASTNode>& nodes) {
   mlir::Value v = condVal;
   for (int i = 0; i < 8 && v; ++i) {
@@ -1975,6 +1979,34 @@ std::vector<ASTNode> buildReductionAssignNodes(hlfir::AssignOp assign, mlir::Ope
 // dispatchScfWhileCall) so every call shape (MPI/FFTW3/QE FFT/BLAS/LAPACK/unsupported-libcall/Fortran I/O/generic) is
 // recognised identically in both. io_state/fft_plans thread the I/O and FFTW3 plan state machines across calls in one
 // block.
+/// The constant a ``__assoc_scalar`` adapter holds: flang passes a literal actual by reference through an alloca
+/// it stores the literal into once, declared under a ``__assoc_scalar_N`` name; an inlined callee's dummy
+/// re-declares that memory under its own name. Nullopt for anything else (a variable of the program).
+static std::optional<int64_t> traceAssocScalarLiteral(mlir::Value v) {
+  std::vector<mlir::Value> places;  // every result of the re-declare chain, then the memory itself
+  bool adapter = false;
+  mlir::Value cur = v;
+  for (int i = 0; i < 8; ++i) {
+    auto decl = mlir::dyn_cast_or_null<hlfir::DeclareOp>(cur.getDefiningOp());
+    if (!decl) break;
+    adapter = adapter || decl.getUniqName().str().find("__assoc_scalar") != std::string::npos;
+    places.push_back(decl.getResult(0));
+    places.push_back(decl.getResult(1));
+    cur = decl.getMemref();
+  }
+  if (!adapter) return std::nullopt;
+  places.push_back(cur);
+  std::optional<int64_t> literal;
+  int stores = 0;
+  for (auto place : places)
+    for (auto* user : place.getUsers())
+      if (auto st = mlir::dyn_cast<fir::StoreOp>(user)) {
+        ++stores;
+        literal = traceConstInt(st.getValue());
+      }
+  return stores == 1 ? literal : std::nullopt;
+}
+
 static void dispatchCallOp(fir::CallOp call, std::vector<ASTNode>& nodes, IoState& io_state,
                            std::map<std::string, FftPlanInfo>& fft_plans) {
   ASTNode n;
@@ -2080,9 +2112,14 @@ static void dispatchCallOp(fir::CallOp call, std::vector<ASTNode>& nodes, IoStat
   }
   // Resolves each operand to a decl name so the builder can lower a registered external (bind(c)) call to a tasklet
   // (harmless for unregistered callees). A by-value integer-constant operand has no decl -- emit its literal value
-  // instead of an empty term.
+  // instead of an empty term. A literal passed by reference comes through flang's ``__assoc_scalar`` adapter (an
+  // alloca with one store of the constant): its value is the term, since nothing else ever defines the adapter.
   for (auto v : call.getArgOperands()) {
-    std::string nm = traceToDecl(v);
+    std::string nm;
+    if (auto lit = traceAssocScalarLiteral(v))
+      nm = std::to_string(*lit);
+    else
+      nm = traceToDecl(v);
     if (nm.empty())
       if (auto c = traceConstInt(v)) nm = std::to_string(*c);
     n.call_args.push_back(nm);
@@ -2272,17 +2309,37 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
         for (auto [dim, extent] : llvm::enumerate(seq.getShape()))
           if (extent == fir::SequenceType::getUnknownExtent()) dynamicDims.push_back(static_cast<unsigned>(dim));
       }
+      // Flang clamps every extent to zero (``arith.select %ext > 0, %ext, 0``): Fortran gives a negative extent a
+      // zero size. The extent tracers peel the clamp to reach the extent itself; the buffer's size keeps it, or an
+      // extent that is negative (an unset default, ``ALLOCATE(phi(1:n))`` with n = -100) allocates a huge buffer.
+      auto clamped = [](mlir::Value v) {
+        for (int k = 0; k < limits::kConvertChainDepth && v; ++k) {
+          auto* od = v.getDefiningOp();
+          if (!od) return false;
+          if (auto cv = mlir::dyn_cast<fir::ConvertOp>(od)) {
+            v = cv.getValue();
+            continue;
+          }
+          auto se = mlir::dyn_cast<mlir::arith::SelectOp>(od);
+          if (!se) return false;
+          auto f = traceConstInt(se.getFalseValue());
+          auto t = traceConstInt(se.getTrueValue());
+          return (f && *f == 0) || (t && *t == 0);
+        }
+        return false;
+      };
       unsigned operand = 0;
       for (auto sz : allocmem.getShape()) {
         unsigned const d = operand < dynamicDims.size() ? dynamicDims[operand] : operand;
         ++operand;
+        bool const clamp = clamped(sz);
         std::string const ext = traceExtentExpr(sz);
         if (!ext.empty()) {
           ASTNode an;
           an.kind = "assign";
           an.target = bufName + "_d" + std::to_string(d);
           an.target_is_array = false;
-          an.expr = ext;
+          an.expr = clamp ? "max(" + ext + ", 0)" : ext;
           nodes.push_back(std::move(an));
         } else {
           // Runtime array-element extent (ALLOCATE(tmp(sz(i)))): traceExtentExpr resolves only const-indexed / scalar /
@@ -2320,7 +2377,10 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
           collectReadAccesses(ev, an.accesses, 0);
           // Only when it really is an element read (accesses populated) and rendered cleanly; else leave the shape
           // symbol to the per-dim synthetic fallback rather than emit a bare array name.
-          if (!an.expr.empty() && an.expr != "?" && !an.accesses.empty()) nodes.push_back(std::move(an));
+          if (!an.expr.empty() && an.expr != "?" && !an.accesses.empty()) {
+            if (clamp) an.expr = "max(" + an.expr + ", 0)";
+            nodes.push_back(std::move(an));
+          }
         }
       }
     }
@@ -2349,6 +2409,39 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
     if (auto allocName = bindAllocSite(&op); !allocName.empty()) {
       emitAllocStateChange(allocName, 1);
       continue;
+    }
+    // ``ALLOCATE(a, SOURCE=b)`` / ``MOLD=b`` sizes ``a`` through the runtime from ``b`` (runtimeShapedAllocation): bind
+    // ``a``'s extent symbols ``<name>_d<i>`` to ``b``'s extents here, as bindAllocSite does from a fir.allocmem's shape
+    // (extract_vars registers the symbols).
+    if (auto call = mlir::dyn_cast<fir::CallOp>(&op)) {
+      if (auto alloc = runtimeShapedAllocation(call); alloc.target) {
+        std::string const name = traceToDecl(alloc.target.getResult(0));
+        // ``!fir.ref<!fir.box<!fir.heap<!fir.array<?x?xT>>>>`` -> the array's rank.
+        int64_t rank = 0;
+        mlir::Type ty = fir::unwrapRefType(alloc.target.getResult(0).getType());
+        if (auto boxTy = mlir::dyn_cast<fir::BaseBoxType>(ty)) ty = fir::unwrapRefType(boxTy.getEleTy());
+        if (auto seq = mlir::dyn_cast<fir::SequenceType>(ty)) rank = static_cast<int64_t>(seq.getDimension());
+        for (int64_t d = 0; d < rank && !name.empty(); ++d) {
+          std::string const ext = boxExtentExpr(alloc.shape, d);
+          if (ext.empty()) continue;
+          ASTNode an;
+          an.kind = "assign";
+          an.target = name + "_d" + std::to_string(d);
+          an.target_is_array = false;
+          an.expr = ext;
+          nodes.push_back(std::move(an));
+        }
+        // SOURCE= also gives the new array the source's values (MOLD= only its shape): a whole-array copy, which the
+        // runtime call performs and nothing else in the IR does.
+        if (std::string const src = traceToDecl(alloc.shape); alloc.copiesValues && !name.empty() && !src.empty()) {
+          ASTNode cp;
+          cp.kind = "copy";
+          cp.target = name;
+          cp.target_is_array = true;
+          cp.reduce_src = src;
+          nodes.push_back(std::move(cp));
+        }
+      }
     }
 
     // Standalone fir.freemem -- Flang's top-level DEALLOCATE expansion (the trailing fir.if(alloc_status != 0){...} is
@@ -3217,7 +3310,10 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
             ref->print(os);
             if (!fftw3CalleeTag(s).empty()) continue;
           }
-      auto expr = buildExpr(st.getValue(), 0);
+      // ``x = ANY(mask)`` / ``ALL(mask)``, e.g. an actual argument ``any(i == idx)`` stored into its association
+      // scalar: reduce the mask like an IF condition does, then read the boolean scalar.
+      std::string const allanyScalar = tryMaterialiseAllAnyCond(st.getValue(), nodes);
+      auto expr = allanyScalar.empty() ? buildExpr(st.getValue(), 0) : allanyScalar;
       // Drops stores with unresolvable RHS -- see note in walkSCFBeforeRegion's fir.store handler.
       if (expr == "?") continue;
       ASTNode a;
@@ -3225,12 +3321,22 @@ std::vector<ASTNode> buildAST(mlir::Block& block) {
       a.target = target;
       a.expr = expr;
       a.target_is_array = false;
-      // Collects the stored value's array-element reads for a value-by-reference associate store
-      // (RewriteSequenceAssociation/ExpandVectorSubscriptGather synthesise a __assoc_scalar alloca + fir.store reaching
-      // here). buildExpr renders an array-ELEMENT read as the bare parent name by design; without these reads the
-      // element leaks as a bare pointer (QE paw_newdxx Gate H). Scoped to __assoc_scalar targets so it doesn't perturb
-      // other stores (e.g. prhoc_d's pointer-rebind).
-      if (target.find("assoc_scalar") != std::string::npos) collectReadAccesses(st.getValue(), a.accesses, 0);
+      if (!allanyScalar.empty()) {
+        AccessInfo read;
+        read.array_name = allanyScalar;
+        read.is_read = true;
+        read.index_vars.emplace_back("1");
+        read.index_exprs.emplace_back("1");
+        a.accesses.push_back(std::move(read));
+      } else if (target.find("assoc_scalar") != std::string::npos || fir::isa_trivial(st.getValue().getType())) {
+        // Collects the stored value's array-element reads: buildExpr renders an array-ELEMENT read as the bare parent
+        // name by design, so without these reads the element leaks as a bare pointer -- a value-by-reference
+        // associate store (RewriteSequenceAssociation/ExpandVectorSubscriptGather synthesise a __assoc_scalar alloca
+        // + fir.store reaching here; QE paw_newdxx Gate H) or any other scalar store, such as the start or trip count
+        // of a lifted DO (``l = ib(3)%beg``).  A box store (prhoc_d's pointer-rebind) is no scalar read and keeps
+        // none.
+        collectReadAccesses(st.getValue(), a.accesses, 0);
+      }
       nodes.push_back(std::move(a));
       continue;
     }

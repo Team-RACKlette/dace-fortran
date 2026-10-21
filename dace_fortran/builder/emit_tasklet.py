@@ -41,6 +41,19 @@ if TYPE_CHECKING:
 _IDENT_RE = re.compile(r"(?<![0-9.])[a-zA-Z_]\w*")
 
 
+def _outside_brackets(expr: str) -> str:
+    """``expr`` without the text inside its (balanced) square brackets: the subscripts of the reads it spells out."""
+    out, depth = [], 0
+    for ch in expr:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
 def _ident_tokens(expr: str) -> set:
     """Identifier tokens in ``expr``, excluding complex-literal imaginary
     units (see ``_IDENT_RE``)."""
@@ -225,16 +238,23 @@ def emit_tasklet(
     r_scl |= _len1_views
     target = assign_node.target
 
-    # Index arrays (e.g. edge_idx) move onto the interstate edge as symbols, not connectors.
+    # Index arrays (e.g. edge_idx) move onto the interstate edge as symbols, not connectors. One read as a value
+    # too (``s = cell(1) + x(cell(1))``) keeps its connectors for those reads: its index loads, each listed right
+    # before the access it indexes, are not occurrences in the expression.
     indirect_arrays = {indirect_host(expr) for expr in indirect_syms}
-    r_arr -= indirect_arrays
+    index_loads = {
+        i for i, ac in enumerate(accesses[:-1])
+        if ac.is_read and ac.array_name in indirect_arrays
+        and any(f"{ac.array_name}[" in str(e) for e in accesses[i + 1].index_exprs or [])
+    }
+    r_arr -= {nm for nm in indirect_arrays if nm not in _ident_tokens(_outside_brackets(assign_node.expr))}
 
     # ONE connector + ONE memlet per textual occurrence (never deduplicated): deduplication misaligns the
     # occurrence-to-access mapping when the accesses list and the expression disagree on count (e.g. MIN/MAX
     # cmp+select).
     reads_by_name: dict[str, list[AccessLike]] = {}
-    for ac in accesses:
-        if ac.is_read and ac.array_name in r_arr:
+    for i, ac in enumerate(accesses):
+        if ac.is_read and ac.array_name in r_arr and i not in index_loads:
             reads_by_name.setdefault(ac.array_name, []).append(ac)
 
     # Connector substitution: scalars -> ``_in_<name>``, Nth array occurrence
@@ -385,6 +405,12 @@ def emit_scalar_assign(builder: SDFGBuilder, state: SDFGState, target: str, valu
     ``icidx => p_patch%edges%cell_idx``) -- emit a whole-array copy memlet
     instead of a scalar tasklet with the wrong subset."""
     value = str(value)
+    # No-op self-assignment (``x = x``): an inlined callee assigning a record dummy to the record it is bound to
+    # (``m = m_in`` called with ``m`` itself) does so member by member.  It moves no value, but as a tasklet it
+    # reads a transient member before anything writes it, and once DaCe promotes the scalar to a symbol, the
+    # read becomes a free symbol nothing can supply.  The symbol path in ``emit_assign`` drops these too.
+    if value.strip().strip("()").strip() == target:
+        return
     # Phantom object-alias scalar members (``p_pat_fn1_comm``) resolve to real
     # SDFG symbols (``p_patch_comm_pat_e_comm``).  Rewrite them before the
     # scalar-read classification so the tasklet body references a registered

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import dace
@@ -84,12 +85,17 @@ class FrozenArg:
     #   aos_origin_mod/struct -- owning module / AoS global name.
     #   aos_member_path       -- '%'-joined component path.
     #   aos_outer_rank        -- leading record-array (element) dim count.
+    #   aos_root_rank         -- dims of a root that is itself an array of
+    #                            records (``field(j) % comp(i) % data``), ahead
+    #                            of the aos_outer_rank ones.
     #   global_alloc_inside   -- kernel ALLOCATEs the component: binding
     #                            allocates the host global, skips copy-in.
     aos_origin_mod: str = ""
     aos_origin_struct: str = ""
     aos_member_path: str = ""
     aos_outer_rank: int = 0
+    aos_root_rank: int = 0
+    aos_struct_static: bool = False  # the root record array has a fixed size: no presence guard
     global_alloc_inside: bool = False
     aos_struct_pointer: bool = False
     aos_member_pointer: bool = False
@@ -105,6 +111,10 @@ class FrozenArg:
     # straight through.  Back on the host, ``device_storage`` clears again.
     storage: str = HOST_STORAGE
     device_storage: str = ""
+    # The packed companion of an array of records this argument is one element of (``element_index``, 0-based):
+    # dace_fortran.array_split split the companion, and the binding passes that element's member itself.
+    element_of: str = ""
+    element_index: int = 0
 
     @property
     def acc_data_clause(self) -> str:
@@ -161,6 +171,14 @@ class FrozenSignature:
     # MPI_Comm_size) into __user_comm/__user_comm_size at dace_init_<entry>
     # time.  None if no runtime MPI comm.
     user_comm_source: str | None = None
+    # The dtype (as :func:`dtype_string` renders it) DaCe gives each free symbol it passes by value: the
+    # C entry takes a shape-only symbol in the width of the SDFG's symbol table (int64 for an inferred
+    # extent), and a wrapper declaring another width hands it a half-written register. Derived from the SDFG
+    # (filled in from it when a snapshot lacks it), so it takes no part in comparing snapshots.
+    symbol_dtypes: dict[str, str] = field(default_factory=dict, compare=False)
+    # Record images the SDFG allocates itself (scratch of the routine): the binding passes nothing for them, but
+    # reads an extent or lower bound of theirs that stayed a symbol off the record on the host.
+    shape_only_args: tuple[FrozenArg, ...] = field(default_factory=tuple)
 
     # ----- I/O ---------------------------------------------------------
 
@@ -177,6 +195,8 @@ class FrozenSignature:
             "schema_version": self.schema_version,
             "module_symbol_origins": {k: list(v) for k, v in self.module_symbol_origins.items()},
             "user_comm_source": self.user_comm_source,
+            "symbol_dtypes": dict(self.symbol_dtypes),
+            "shape_only_args": [a.to_dict() for a in self.shape_only_args],
         }
 
     @classmethod
@@ -190,6 +210,8 @@ class FrozenSignature:
             schema_version=d.get("schema_version", 1),
             module_symbol_origins={k: ModuleOrigin(*v) for k, v in d.get("module_symbol_origins", {}).items()},
             user_comm_source=d.get("user_comm_source"),
+            symbol_dtypes=dict(d.get("symbol_dtypes", {})),
+            shape_only_args=tuple(FrozenArg.from_dict(a) for a in d.get("shape_only_args", [])),
         )
 
     def to_json(self, path: str) -> None:
@@ -221,7 +243,10 @@ class FrozenSignature:
         # models them separately, so validate as two partitions here.
         live_names = [k for k in live_arglist if k not in live_fs]
         snap_names = [a.sdfg_name for a in self.args if a.sdfg_name not in snap_fs]
-        if live_names != snap_names:
+        # Compared as sorted lists: the live arglist is in DaCe's (lexicographic) order while the snapshot lists the
+        # elements of a split array of records in element order (``x_2`` before ``x_10``); the C interface takes
+        # its order from the compiled signature, not from either.
+        if sorted(live_names) != sorted(snap_names):
             raise SignatureDriftError(
                 f"signature drift on {self.entry!r}: expected args {snap_names}, got {live_names}"
             )
@@ -270,8 +295,19 @@ def get_frozen_signature(sdfg: SDFG) -> FrozenSignature | None:
     if cached is not None and cached[0] is raw:
         return cached[1]
     frozen = FrozenSignature.from_dict(raw)
+    if frozen.free_symbols and not frozen.symbol_dtypes:
+        # A snapshot taken before the widths were recorded: read them from the live SDFG.
+        frozen = replace(frozen, symbol_dtypes=symbol_dtypes_of(sdfg, frozen.free_symbols))
     vars(sdfg)[_CACHE_ATTR] = (raw, frozen)
     return frozen
+
+
+def symbol_dtypes_of(sdfg: SDFG, names: Iterable[str]) -> dict[str, str]:
+    """The dtype DaCe passes each of the free symbols ``names`` with: its argument list's, which is the symbol
+    table's entry or DaCe's default for an undeclared symbol."""
+    arglist = sdfg.arglist()
+    # A symbol that only shapes an array no state touches is not passed at all: no entry for it.
+    return {name: dtype_string(arglist[name]) for name in names if name in arglist}
 
 
 def _metadata(sdfg: SDFG) -> dict[str, Any]:
@@ -307,6 +343,29 @@ def _install_sdfg_accessor() -> None:
 _install_sdfg_accessor()
 
 
+def drop_unread_module_inputs(sdfg: SDFG) -> list[str]:
+    """Remove the inputs ``sdfg`` takes from a module variable but no longer reads, and return their names.
+
+    The frontend hands an entry every module variable its code may read; once optimisation has folded the branches
+    that read them, most are dead weight the binding would still copy in on every call.  Only module variables go:
+    the caller's own buffers are the ABI.  Re-snapshot with :func:`refreeze` afterwards.
+    """
+    from dace_fortran.pipelines import read_data
+
+    frozen = get_frozen_signature(sdfg)
+    if frozen is None:
+        return []
+    read = read_data(sdfg)
+    unread = [
+        name
+        for name in frozen.module_symbol_origins
+        if name in sdfg.arrays and not sdfg.arrays[name].transient and name not in read
+    ]
+    for name in unread:
+        sdfg.remove_data(name, validate=False)
+    return unread
+
+
 def refreeze(sdfg: SDFG) -> FrozenSignature:
     """Re-snapshot after a DELIBERATE transformation of the built SDFG (e.g. an optimization
     pipeline run between ``build()`` and ``build_fortran_library``), so the bindings regenerate
@@ -317,9 +376,11 @@ def refreeze(sdfg: SDFG) -> FrozenSignature:
     * array (and MPI communicator) args must match the original snapshot exactly -- names,
       order, dtypes.  The caller's buffers are the ABI, so one going missing means the
       wrapper would stop passing memory the kernel still expects, or vice versa;
-    * scalar args and the free-symbol set may SHRINK, which is what specialization does:
-      folding a value to a constant deletes its argument, and the binding simply derives
-      and passes fewer. A scalar the kernel no longer reads costs the caller nothing;
+    * scalar args, the free-symbol set and the args the binding reads from a module may
+      SHRINK, which is what specialization does: folding a value to a constant deletes its
+      argument, and the binding simply derives and passes fewer. A scalar the kernel no
+      longer reads costs the caller nothing, and a module variable is no buffer of the
+      caller's (a module scalar crosses as a one-element array, ABI-preserved);
     * anything NEW is refused, symbol or scalar -- the binding has no value derivation
       for an argument that was not in the Fortran interface.
 
@@ -347,18 +408,22 @@ def refreeze(sdfg: SDFG) -> FrozenSignature:
         )
 
     dropped_buffers = [
-        a.sdfg_name for a in frozen.args if a.kind not in _MAY_SHRINK and a.sdfg_name not in live_arglist
+        a.sdfg_name
+        for a in frozen.args
+        if a.kind not in _MAY_SHRINK
+        and a.sdfg_name not in frozen.module_symbol_origins
+        and a.sdfg_name not in live_arglist
     ]
     if dropped_buffers:
         raise SignatureDriftError(
             f"refreeze on {frozen.entry!r}: optimization removed "
-            f"args {dropped_buffers}; only scalars and free symbols may shrink"
+            f"args {dropped_buffers}; only scalars, free symbols and module variables may shrink"
         )
 
     def _survives(a: FrozenArg) -> bool:
         # Anything gone from both the arglist and the free symbols was folded to a constant:
-        # drop it so the regenerated binding stops deriving and passing it.  Only scalars and
-        # symbols reach here -- the rest are refused above.
+        # drop it so the regenerated binding stops deriving and passing it.  Only scalars,
+        # symbols and module variables reach here -- the rest are refused above.
         return a.sdfg_name in live_arglist or a.sdfg_name in live_fs
 
     def _relocate(a: FrozenArg) -> FrozenArg:
@@ -368,10 +433,12 @@ def refreeze(sdfg: SDFG) -> FrozenSignature:
         name = live.storage.name if live is not None else ""
         return replace(a, device_storage=name if name.startswith(DEVICE_STORAGE_PREFIX) else "")
 
+    kept_symbols = tuple(s for s in frozen.free_symbols if s in live_fs)
     new = replace(
         frozen,
         args=tuple(_relocate(a) for a in frozen.args if _survives(a)),
-        free_symbols=tuple(s for s in frozen.free_symbols if s in live_fs),
+        free_symbols=kept_symbols,
+        symbol_dtypes=symbol_dtypes_of(sdfg, kept_symbols),
     )
     # Full re-validation (arg partition, per-arg dtypes, symbol set) against the live SDFG.
     new.verify_against(sdfg)

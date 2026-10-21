@@ -117,6 +117,122 @@ def mpi_stub_source() -> str:
     return _MPI_STUB_SOURCE
 
 
+# MODULE openacc: the OpenACC runtime API (OpenACC 3.3, section 3.2) for code built
+# with an OpenACC compiler, whose ``openacc`` module flang does not ship.  Kinds,
+# device-type constants and the routines' Fortran interfaces; the data routines
+# take any variable (``type(*), dimension(..)``).  Values of the device-type
+# constants are implementation-defined; these are NVIDIA HPC SDK's.
+_OPENACC_STUB_SOURCE = """\
+! Stub ``MODULE openacc`` for the flang frontend: the OpenACC runtime API's
+! kinds, device-type constants and interfaces.  Runtime symbols are resolved at
+! link time against the OpenACC runtime -- this module only has to satisfy the
+! flang semantic checker.
+MODULE openacc
+  IMPLICIT NONE
+  INTEGER, PARAMETER :: openacc_version = 202211
+  INTEGER, PARAMETER :: acc_device_kind = 4
+  INTEGER, PARAMETER :: acc_device_property_kind = 4
+  INTEGER, PARAMETER :: acc_handle_kind = 4
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_none = 0
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_default = 1
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_host = 2
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_not_host = 3
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_nvidia = 4
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_radeon = 8
+  INTEGER(acc_device_kind), PARAMETER :: acc_device_current = -1
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_noval = -1
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_sync = -2
+  INTEGER(acc_handle_kind), PARAMETER :: acc_async_default = -3
+  INTERFACE
+    INTEGER FUNCTION acc_get_num_devices(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_get_num_devices
+    SUBROUTINE acc_set_device_type(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_set_device_type
+    INTEGER(acc_device_kind) FUNCTION acc_get_device_type()
+      IMPORT :: acc_device_kind
+    END FUNCTION acc_get_device_type
+    SUBROUTINE acc_set_device_num(dev_num, dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER, VALUE :: dev_num
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_set_device_num
+    INTEGER FUNCTION acc_get_device_num(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_get_device_num
+    SUBROUTINE acc_init(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_init
+    SUBROUTINE acc_shutdown(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END SUBROUTINE acc_shutdown
+    LOGICAL FUNCTION acc_async_test(wait_arg)
+      INTEGER, VALUE :: wait_arg
+    END FUNCTION acc_async_test
+    LOGICAL FUNCTION acc_async_test_all()
+    END FUNCTION acc_async_test_all
+    SUBROUTINE acc_wait(wait_arg)
+      INTEGER, VALUE :: wait_arg
+    END SUBROUTINE acc_wait
+    SUBROUTINE acc_wait_all()
+    END SUBROUTINE acc_wait_all
+    LOGICAL FUNCTION acc_on_device(dev_type)
+      IMPORT :: acc_device_kind
+      INTEGER(acc_device_kind), VALUE :: dev_type
+    END FUNCTION acc_on_device
+    LOGICAL FUNCTION acc_is_present(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END FUNCTION acc_is_present
+    SUBROUTINE acc_copyin(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_copyin
+    SUBROUTINE acc_create(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_create
+    SUBROUTINE acc_copyout(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_copyout
+    SUBROUTINE acc_delete(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_delete
+    SUBROUTINE acc_update_device(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_update_device
+    SUBROUTINE acc_update_self(data_arg, bytes)
+      TYPE(*), DIMENSION(..) :: data_arg
+      INTEGER, VALUE, OPTIONAL :: bytes
+    END SUBROUTINE acc_update_self
+    SUBROUTINE acc_map_data(data_arg, data_dev, bytes)
+      USE, INTRINSIC :: iso_c_binding, ONLY: c_ptr, c_size_t
+      TYPE(*), DIMENSION(..) :: data_arg
+      TYPE(c_ptr), VALUE :: data_dev
+      INTEGER(c_size_t), VALUE :: bytes
+    END SUBROUTINE acc_map_data
+    SUBROUTINE acc_unmap_data(data_arg)
+      TYPE(*), DIMENSION(..) :: data_arg
+    END SUBROUTINE acc_unmap_data
+  END INTERFACE
+END MODULE openacc
+"""
+
+
+def openacc_stub_source() -> str:
+    """Fortran source for ``MODULE openacc``, the OpenACC runtime API; needs no ``-I`` flags."""
+    return _OPENACC_STUB_SOURCE
+
+
 # Not vendored (4 MB, updates yearly): fetched from upstream on first use
 # and cached, same layout as the bridge's own build (~/.cache/dace-fortran).
 _NETCDF_FORTRAN_URL = "https://github.com/Unidata/netcdf-fortran/archive/refs/tags/v{version}.tar.gz"
@@ -217,6 +333,7 @@ def _netcdf_flags(cache_dir: Path | None = None, **_: Any) -> list[str]:
 LIBRARY_STUBS: dict[str, LibraryStub] = {
     "mpi": LibraryStub(name="mpi", source=lambda **_: mpi_stub_source(), flags=_mpi_flags),
     "netcdf": LibraryStub(name="netcdf", source=_netcdf_source, flags=_netcdf_flags),
+    "openacc": LibraryStub(name="openacc", source=lambda **_: openacc_stub_source(), flags=lambda **_: []),
 }
 
 # ---------------------------------------------------------------------------
@@ -249,6 +366,85 @@ def patch_mpi_sizeof(source: str) -> str:
         return f"{indent}{sz} = {sz_val}; {err} = 0  ! flang-21 stub for MPI_SIZEOF({arg})"
 
     return _MPI_SIZEOF_RE.sub(_replace, source)
+
+
+# A constant subscript outside an array's constant bounds, which flang-21 rejects even in code a constant condition
+# makes dead (``if (num_dims > 2) x(3) = ...`` with ``x(num_dims)`` and ``num_dims = 2``).
+_OUT_OF_BOUNDS_RE = re.compile(
+    r"^(?P<file>[^\n:]+):(?P<line>\d+):(?P<col>\d+): error: subscript (?P<value>-?\d+) is "
+    r"(?:greater than upper|less than lower) bound (?P<bound>-?\d+) for dimension (?P<dim>\d+) of array",
+    re.MULTILINE,
+)
+_LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?(\d+)\s+"([^"]+)"')
+
+
+def _origin_lines(source: str, path: str | None = None) -> dict[tuple[str, int], list[int]]:
+    """Map ``(file, line)`` as the line markers of ``source`` name it -- and, for ``path``, the file ``source`` is
+    compiled from, its own line numbers -- to the indices of the lines in ``source`` it stands for: several when a
+    preprocessor expanded that line more than once (a loop over directions, say)."""
+    origin: dict[tuple[str, int], list[int]] = {}
+    current: tuple[str, int] | None = None
+    for index, text in enumerate(source.splitlines()):
+        if path is not None:
+            origin.setdefault((path, index + 1), []).append(index)
+        marker = _LINE_MARKER_RE.match(text)
+        if marker:
+            current = (marker.group(2), int(marker.group(1)))
+            continue
+        if current is not None:
+            origin.setdefault(current, []).append(index)
+            current = (current[0], current[1] + 1)
+    return origin
+
+
+def _clamp_subscript(text: str, column: int, dim: int, value: int, bound: int) -> str | None:
+    """``text`` with the ``dim``-th subscript of the array reference starting at ``column`` (1-based) replaced by
+    ``bound`` when it is the integer literal ``value``; None when the reference does not look like that."""
+    start = column - 1
+    paren = text.find("(", start)
+    if paren < 0 or not re.fullmatch(r"[A-Za-z_][\w%]*\s*", text[start:paren]):
+        return None
+    depth, pieces, last = 0, [], paren + 1
+    for i in range(paren, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                pieces.append((last, i))
+                break
+        elif text[i] == "," and depth == 1:
+            pieces.append((last, i))
+            last = i + 1
+    if len(pieces) < dim:
+        return None
+    a, b = pieces[dim - 1]
+    if text[a:b].strip() != str(value):
+        return None
+    return f"{text[:a]}{bound}{text[b:]}"
+
+
+def clamp_out_of_bounds_constant_subscripts(source: str, flang_errors: str, path: str | None = None) -> tuple[str, int]:
+    """Clamp each constant subscript flang reports as outside its array's constant bounds to that bound.
+
+    Such a reference is undefined behaviour if it ever executes, so no valid execution runs it -- it sits in code a
+    constant condition rules out -- and any in-bounds value keeps every valid execution's meaning, while flang-21
+    rejects the source as it stands.  ``path``: the file flang compiled ``source`` from, for positions it reports in
+    that file itself.  Returns the patched source and the number of subscripts clamped.
+    """
+    origin = _origin_lines(source, path)
+    lines = source.splitlines(keepends=True)
+    clamped = 0
+    for m in _OUT_OF_BOUNDS_RE.finditer(flang_errors):
+        # The first of the lines it may stand for whose reference at that column has that literal subscript.
+        for index in origin.get((m.group("file"), int(m.group("line"))), []):
+            patched = _clamp_subscript(lines[index], int(m.group("col")), int(m.group("dim")), int(m.group("value")),
+                                       int(m.group("bound")))
+            if patched is not None and patched != lines[index]:
+                lines[index] = patched
+                clamped += 1
+                break
+    return "".join(lines), clamped
 
 
 # Patch registry: name -> source-to-source transform.
@@ -365,7 +561,7 @@ def prepare_flang_translation_unit(
     :param search_dirs: directories scanned by
         :func:`merge_used_modules` for sibling modules.
     :param library_stubs: names of upstream-library stubs to opt into;
-        keys of :data:`LIBRARY_STUBS` (``'mpi'``, ``'netcdf'``).
+        keys of :data:`LIBRARY_STUBS` (``'mpi'``, ``'netcdf'``, ``'openacc'``).
     :param patches: names of flang-21 text patches to apply; keys of
         :data:`FLANG_BUG_PATCHES`.  Default is the single safe one
         (``'mpi_sizeof'``) -- only matches the literal call pattern
@@ -459,6 +655,18 @@ def emit_hlfir_from_codebase(
     )
     tu_path = out_path.with_suffix(".F90")
     tu_path.write_text(tu_source)
+    base = [flang_program or require_flang(), "-fc1", "-cpp", "-U_OPENMP", "-U_OPENACC", *flang_flags, *extra_flang_flags]
+    # Constant subscripts outside constant bounds in dead code: clamp them and check again (a few rounds: flang stops
+    # reporting after the first errors of a scope).
+    for _ in range(8):
+        check = subprocess.run([*base, "-fsyntax-only", str(tu_path)], cwd=str(out_path.parent), capture_output=True,
+                               text=True)
+        if check.returncode == 0:
+            break
+        tu_source, clamped = clamp_out_of_bounds_constant_subscripts(tu_source, check.stderr + check.stdout, str(tu_path))
+        if not clamped:
+            break
+        tu_path.write_text(tu_source)
     # Run flang with ``cwd = out_path.parent`` so its default module
     # search (which includes ".") doesn't pick up stale gfortran-format
     # ``.mod`` files left in the caller's working directory from prior

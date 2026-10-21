@@ -725,6 +725,8 @@ def add_descriptors(builder: SDFGBuilder, sdfg: SDFG) -> None:
     # symbol stays free on the SDFG signature.  Populated here so
     # ``builder.offset_values`` is fully filled before any AST emission
     # references the symbols in memlet subsets.
+    value_symbol_names = {vs.symbol for vs in builder.value_symbols}
+
     def _offset_value(s: str) -> int | str | None:
         s = s.strip()
         if s == "?" or not s:
@@ -742,9 +744,10 @@ def add_descriptors(builder: SDFGBuilder, sdfg: SDFG) -> None:
         # Symbolic lb (e.g. caller-supplied ``arrsize``).  If the symbol
         # is already declared on the SDFG (a known dummy / Fortran sym),
         # pass the name through; sdfg.specialize will alias one symbol
-        # to the other.  Otherwise leave unknown so the offset stays
-        # free.
-        return s if s in sdfg.symbols else None
+        # to the other.  An array-element bound is a value-symbol, seeded
+        # at entry from the element read (``_seed_value_symbols``).
+        # Otherwise leave unknown so the offset stays free.
+        return s if s in sdfg.symbols or s in value_symbol_names else None
 
     for v in builder.arrays.values():
         if _is_flang_internal(v.fortran_name) or is_character_dtype(v.dtype):
@@ -964,6 +967,11 @@ def add_descriptors(builder: SDFGBuilder, sdfg: SDFG) -> None:
                 continue
             lb = v.lower_bounds[d] if d < len(v.lower_bounds) else "1"
             builder.offset_values[sym_name] = _offset_value(lb)
+            floors = getattr(v, "lower_bound_floors", ())
+            if builder.offset_values[sym_name] is None and d < len(floors) and floors[d]:
+                # The bound only the caller knows: a direct call defaults the free offset to the smallest literal
+                # subscript the code uses (the bound is at or below it), a binding passes ``lbound``.
+                builder.offset_floors[sym_name] = int(floors[d])
 
     # Scalars that are the TARGET of a scalar POINTER rebind (``tmp => x``)
     # must be materialised as a length-1 ARRAY, not a ``Scalar``: the rebind

@@ -82,6 +82,8 @@ class ArgKind(Enum):
     SCALAR = "scalar"
     AOS = "aos"
     COMM = "comm"
+    #: An absent optional argument: the call passes a null pointer and the SDFG connects nothing.
+    NONE = "none"
 
 
 class CAbi(Enum):
@@ -133,7 +135,10 @@ class Arg:
 
         * ``ARRAY`` -- a flat array dummy.  C ABI defaults to a
           pointer (``<ctype> *``).
-        * ``SCALAR`` -- a scalar dummy.  C ABI defaults to by-value.
+        * ``SCALAR`` -- a scalar dummy.  C ABI defaults to by-value;
+          with ``c_abi=POINTER`` it crosses by address, as a Fortran
+          ``optional`` scalar of a ``bind(c)`` procedure does: a null
+          pointer where the call site leaves it absent.
         * ``AOS`` -- a whole derived-type dummy that
           ``hlfir-marshal-external-structs`` expanded into per-member
           slots.  The :ivar:`c_abi` choice picks how those slots
@@ -209,6 +214,8 @@ class Arg:
 
         :raises ValueError: unsupported ``kind`` or ``dtype``.
         """
+        if self.kind is ArgKind.NONE:
+            return "void *"
         if self.kind is ArgKind.COMM:
             return _OPAQUE_COMM_DTYPE
         if self.kind is ArgKind.AOS:
@@ -226,7 +233,8 @@ class Arg:
         base = C_TYPES.get(self.dtype)
         if base is None:
             raise ValueError(f"external Arg: unsupported dtype {self.dtype!r}; known: {sorted(C_TYPES)}")
-        return f"{base} *" if self.kind is ArgKind.ARRAY else base
+        by_pointer = self.kind is ArgKind.ARRAY or self.resolved_c_abi() is CAbi.POINTER
+        return f"{base} *" if by_pointer else base
 
 
 #: The natural C ABI of each argument kind.
@@ -638,7 +646,7 @@ class ExpandExternalCallPure(ExpandTransformation):
     ) -> dace.nodes.Tasklet:
         assert isinstance(node, ExternalCall)
         if node.c_decl:
-            parent_sdfg.append_global_code(node.c_decl)
+            parent_sdfg.append_global_code(f"\n{node.c_decl}\n")  # on lines of its own: it may hold a pragma
         return dace.sdfg.nodes.Tasklet(
             node.label,
             dict(node.in_connectors),
@@ -705,6 +713,14 @@ class ExternalCall(dace.sdfg.nodes.LibraryNode):
         fsyms = super().free_symbols
         fsyms.update(str(dep) for dep in self.symbol_deps)  # dace types the Property as ``list[type[str]]``
         return fsyms
+
+    def specialize(self, values: Mapping[str, Any]) -> None:
+        """Replace the symbols the body forwards by ``values`` (the SDFG specialised to them: the symbols are gone,
+        the C text would still name them)."""
+        for name, value in values.items():
+            if name in self.symbol_deps:
+                self.body = re.sub(rf"\b{re.escape(name)}\b", f"({value})", self.body)
+                self.symbol_deps = [str(d) for d in self.symbol_deps if str(d) != name]
 
     def validate(self, sdfg: dace.SDFG, state: SDFGState) -> None:
         """Reject the node if the C body does not actually call ``c_name``

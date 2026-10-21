@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import TYPE_CHECKING, NamedTuple
 
-from dace import Memlet
+from dace import Memlet, subsets
 from dace.sdfg import nodes
 
 if TYPE_CHECKING:
@@ -112,19 +112,46 @@ class SkippedEdge(NamedTuple):
     dst: nodes.Node
 
 
+def order_writers(state: SDFGState) -> list[SkippedEdge]:
+    """Order the writers of every access node that more than one statement stores into at elements that may be the
+    same: two stores into one node (``p = 0`` and, once a branch is folded, ``p = expr``) are otherwise unordered,
+    and the last store emitted wins whichever it is.  The later writer runs after the earlier one; stores into
+    elements that cannot be the same (``b(1) = ...``, ``b(2) = ...``), and accumulations (write-conflict resolved
+    stores), which commute, stay as they are.
+
+    :return: the edges that had to be skipped to keep the state acyclic.
+    """
+    skipped: list[SkippedEdge] = []
+    for node in state.data_nodes():
+        stores = [(e.src, e.data.get_dst_subset(e, state)) for e in state.in_edges(node)
+                  if not e.data.is_empty() and e.data.wcr is None]
+        stores.sort(key=lambda store: state.node_id(store[0]))
+        pairs = [(a, b) for i, (a, sa) in enumerate(stores) for b, sb in stores[i + 1:]
+                 if a is not b and (sa is None or sb is None or subsets.intersects(sa, sb) is not False)]
+        for earlier, later in pairs:
+            src, dst = completion_anchor(state, earlier), start_anchor(state, later)
+            if dst in descendants(state, src):
+                continue
+            if src in descendants(state, dst):
+                skipped.append(SkippedEdge(node.data, src, dst))
+                continue
+            state.add_nedge(src, dst, Memlet())
+    return skipped
+
+
 def order_state(state: SDFGState) -> list[SkippedEdge]:
     """Add ordering edges for every unordered same-container pair in ``state``.
 
     :return: list of ``(container, src, dst)`` triples that had to be skipped to keep the state
         acyclic.
     """
+    skipped = order_writers(state)
     scopes = state.scope_dict()
     by_container = defaultdict(list)
     for node in state.data_nodes():
         if scopes[node] is None:
             by_container[node.root_data].append(node)
 
-    skipped: list[SkippedEdge] = []
     for container, access_nodes in by_container.items():
         if len(access_nodes) < 2:
             continue
@@ -133,15 +160,21 @@ def order_state(state: SDFGState) -> list[SkippedEdge]:
 
         for index, earlier in enumerate(ordered):
             for later in ordered[index + 1 :]:
-                if later in reach[id(earlier)] or earlier in reach[id(later)]:
+                if earlier in reach[id(later)]:
                     continue
                 earlier_writes = state.in_degree(earlier) > 0
                 later_writes = state.in_degree(later) > 0
                 if not earlier_writes and not later_writes:
                     continue
                 if later_writes:
+                    # A path from ``earlier`` to ``later`` orders only the readers on it: in ``w = p * q`` /
+                    # ``p = p * 2`` the update reads the node the first statement read, so ``p`` (read) reaches
+                    # ``p`` (written) through the update while the first statement's read stays unordered against
+                    # the store.  Every reader is checked; the ones already ordered are skipped below.
                     sources = load_anchors(state, earlier)
                     targets = store_anchors(state, later)
+                elif later in reach[id(earlier)]:
+                    continue
                 else:
                     sources = [earlier]
                     targets = [later]

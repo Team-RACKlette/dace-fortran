@@ -133,6 +133,11 @@ mlir::Value matchAssociatedStatusBoxRef(mlir::arith::CmpIOp cmp, bool* negated =
 /// synthetic-symbol path.
 std::string traceExtentExpr(mlir::Value v);
 
+/// The extent of dimension ``dim`` of a box as traceExtentExpr renders it: the shape operand of the fir.embox that
+/// built it (a dummy or local with an explicit shape), else the ``<name>_d<dim>`` symbol of the array it boxes; empty
+/// if neither resolves.
+std::string boxExtentExpr(mlir::Value box, int64_t dim);
+
 /// Walk the same SSA chain traceExtentExpr recognises, appending every leaf scalar-declare name to out; used by
 /// extract_vars Pass 2 to promote those scalars so traceExtentExpr's expression string doesn't reference undeclared
 /// SDFG names.
@@ -186,6 +191,10 @@ mlir::Value peelBoxReinterpret(mlir::Value v, int maxDepth = limits::kAliasMemre
 /// block-arg/alloca). Callers walk through to the caller-side member (gate #11 in traceToDecl; reused as gate #12 by
 /// rootedAtStructDummy/walkMemberChain).
 bool leadsToComponentDesignate(mlir::Value mr);
+/// True when an inlined dummy's declare is bound to a struct-COMPONENT actual, directly (``leadsToComponentDesignate``
+/// of its memref) or through the declares of the inlined dummies it is passed on as (``twice(w)`` called from
+/// ``mid(w)``, itself called with ``fl(id) % vf``).
+bool dummyChainLeadsToComponent(hlfir::DeclareOp dc);
 
 /// If v peels to a PURE array-of-records SECTION designate (triplet/scalar subscripts, no component selector,
 /// RecordType element) whose base leads to a struct COMPONENT, return that section, else null. Narrow gate for the
@@ -200,6 +209,14 @@ hlfir::DesignateOp asInlinedSectionOverComponent(hlfir::DeclareOp decl);
 /// Number of SCALAR (non-triplet) subscript dims of a section designate -- the fixed record indices the AoR section
 /// pins. vec_in over p_vn(:,:,blockno) -> 1.
 unsigned countScalarSectionDims(hlfir::DesignateOp sec);
+
+/// The rank of a declare's own view (its array type), 0 for a scalar.
+unsigned declaredRank(hlfir::DeclareOp decl);
+
+/// An ELEMENT actual (every subscript scalar, no triplet) bound to a RANK-1 dummy: sequence association,
+/// ``call recon(q%vf(e), ...)`` with ``v_vf(lb:ub)`` -- the dummy's subscript counts from that element on, so the
+/// element's last subscript composes with it instead of standing beside it as a record dimension of its own.
+bool isElementActualOfRank1Dummy(hlfir::DeclareOp decl, hlfir::DesignateOp sec);
 
 /// If decl is a LOCAL pointer to a whole derived-type object rebound once via ptr => <source>, return the source value
 /// (peeled to its declare/component designate); null if not a local record-object pointer, rebind is ambiguous, or

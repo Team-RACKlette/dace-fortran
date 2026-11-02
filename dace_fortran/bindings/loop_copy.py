@@ -476,16 +476,69 @@ def _aos_alloc_bounds(recipe: FlattenRecipe, outer_expr: str, spread: bool = Fal
     ]
 
 
+def own_shape_symbols(name: str, rank: int) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The symbols the SDFG addresses an element split with its own shape by (``name``, its array of rank ``rank``):
+    its extents ``cap_<name>_d<k>`` and its lower bounds ``lb_<name>_d<k>``, ``k`` 0-based."""
+    return tuple(f"cap_{name}_d{k}" for k in range(rank)), tuple(f"lb_{name}_d{k}" for k in range(rank))
+
+
+def _refusal(outer_expr: str, declined_flag: str | None, why: str) -> list[str]:
+    """Decline the call through ``declined_flag`` (when the wrapper has one and the caller passes it), else stop."""
+    refuse = []
+    if declined_flag:
+        refuse += [f"if (present({declined_flag})) then",
+                   f"  write(0, '(a)') 'declined: an element of {outer_expr} {why}'",
+                   f"  {declined_flag} = .true.", "  return", "end if"]
+    refuse.append(f"error stop 'an element of {outer_expr} {why}'")
+    return refuse
+
+
+def _render_own_shape_members(recipe: FlattenRecipe, outer_expr: str, elements: Mapping, declined_flag: str | None
+                              ) -> list[str]:
+    """:func:`render_aos_alloc_members` for elements split with their own shapes: each present, contiguous member
+    is aliased as it is, and its extents and lower bounds go to the symbols :func:`own_shape_symbols` names. The
+    elements' common bounds are taken too, for any subscript of the SDFG still counted from them."""
+    member_at_i = _aos_alloc_member_at_i(recipe)
+    present = _aos_alloc_presence(recipe, member_at_i)
+    absent = _refusal(outer_expr, declined_flag, "is absent")
+    scattered = _refusal(outer_expr, declined_flag, "is not contiguous")
+    lines = [
+        f"    ! ----- Members of {outer_expr}, one array per element, aliased in place with their own shapes -----",
+        *_aos_alloc_bounds(recipe, outer_expr, spread=True),
+    ]
+    for index, name in sorted(elements.items()):
+        caps, lbs = own_shape_symbols(name, len(recipe.cap_symbols))
+        # Presence first: Fortran's .and. does not short-circuit, and an absent member has no shape to query.
+        lines += [
+            *(f"    i{d} = {i + 1}" for d, i in enumerate(index, start=1)),
+            f"    if (.not. {present}) then",
+            *(f"      {ln}" for ln in absent),
+            "    end if",
+            f"    if (.not. is_contiguous({member_at_i})) then",
+            *(f"      {ln}" for ln in scattered),
+            "    end if",
+            *(f"    {cap} = size({member_at_i}, {k})" for k, cap in enumerate(caps, start=1)),
+            *(f"    {lb} = lbound({member_at_i}, {k})" for k, lb in enumerate(lbs, start=1)),
+            f"    {name} => {member_at_i}",
+        ]
+    return lines
+
+
 def render_aos_alloc_members(
-    recipe: FlattenRecipe, outer_expr: str, elements: Mapping[int, str], declined_flag: str | None = None
+    recipe: FlattenRecipe, outer_expr: str, elements: Mapping, declined_flag: str | None = None,
+    own_shape: bool = False
 ) -> list[str]:
     """Hand the SDFG the members of an array of records one by one instead of packed: ``elements`` maps a 0-based
     element index to the SDFG array it split into (:func:`dace_fortran.array_split.split_array`), which becomes a
     pointer to that element's member.  The SDFG addresses every member with the recipe's caps and lower bounds, so
     each must be present, contiguous and exactly that shape; otherwise the wrapper declines the call through
-    ``declined_flag`` (when the wrapper has one and the caller passes it) or stops."""
+    ``declined_flag`` (when the wrapper has one and the caller passes it) or stops. ``own_shape``: the elements
+    were split with shapes of their own, keyed by their indices (one per record dimension), see
+    :func:`_render_own_shape_members`."""
     if not recipe.aos_alloc:
         raise ValueError("render_aos_alloc_members called on non-aos_alloc recipe")
+    if own_shape:
+        return _render_own_shape_members(recipe, outer_expr, elements, declined_flag)
     if aos_outer_rank(recipe) != 1:
         raise ValueError("render_aos_alloc_members takes the members of a rank-1 array of records")
     member_at_i = _aos_alloc_member_at_i(recipe)
@@ -496,13 +549,7 @@ def render_aos_alloc_members(
         + [f"size({member_at_i}, {k}) == {cap}" for k, cap in zip(dims, recipe.cap_symbols, strict=True)]
         + [f"lbound({member_at_i}, {k}) == {lb}" for k, lb in zip(dims, recipe.lb_symbols, strict=True)]
     )
-    refuse = []
-    if declined_flag:
-        refuse += [f"if (present({declined_flag})) then",
-                   f"  write(0, '(a)') 'declined: an element of {outer_expr} is absent or not of the shape its "
-                   "siblings share'",
-                   f"  {declined_flag} = .true.", "  return", "end if"]
-    refuse.append(f"error stop 'an element of {outer_expr} is absent or not of the shape its siblings share'")
+    refuse = _refusal(outer_expr, declined_flag, "is absent or not of the shape its siblings share")
     lines = [
         f"    ! ----- Members of {outer_expr}, one array per element, aliased in place -----",
         *_aos_alloc_bounds(recipe, outer_expr),

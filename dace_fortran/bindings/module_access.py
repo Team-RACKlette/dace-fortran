@@ -55,6 +55,108 @@ class ExposedVariable:
     c_accessor: str = ""  # binding name of the ``bind(c)`` accessor: ``dace_access_<module>_<name>``
 
 
+@dataclass(frozen=True)
+class ReleaseSpec:
+    """A module variable whose storage the substitute has replaced, to free in the module copy's release procedure:
+    a plain array is deallocated and allocated anew with one element along each dimension (the caller's own macros'
+    pattern, so its finalisation is unchanged); an array of records keeps its host storage and loses the device copies
+    of the members on ``path``: ``(component, rank, pointer)`` per level, the last the member itself."""
+
+    name: str
+    path: tuple[tuple[str, int, bool], ...] = ()
+    # Nothing of the substitute reads the host array: its allocate statements in the module copy allocate one element
+    # per dimension instead, so it never takes device memory; a statement not found falls back to the release procedure.
+    shrink_allocation: bool = False
+
+
+RELEASE_PREFIX = "dace_release_"
+
+
+_ALLOCATE = re.compile(r"^(\s*allocate\s*\()(.*)(\)\s*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def shrink_allocations(source: str, spec: ReleaseSpec) -> tuple[str, int]:
+    """``source`` with every allocation of the variable ``spec`` names (or of its member on ``spec.path``) in a
+    one-line ``allocate`` statement taking one element per dimension, and how many allocations changed. The other
+    objects of a statement that allocates several, and its options (``stat=``...), stay as they are."""
+    target = re.escape(spec.name)
+    for component, _rank, _pointer in spec.path:
+        target += r"(?:\([^()]*\))?\s*%\s*" + re.escape(component)
+    allocation = re.compile(r"(" + target + r")\s*\((.*)\)", re.IGNORECASE | re.DOTALL)
+    changed = 0
+
+    def statement(m: re.Match) -> str:
+        nonlocal changed
+        objects, before = _split_top_level(m.group(2)), changed
+        for k, obj in enumerate(objects):
+            one = allocation.fullmatch(obj)
+            if one:
+                dims = len(_split_top_level(one.group(2)))
+                objects[k] = f"{one.group(1)}({', '.join(['1'] * dims)})"
+                changed += 1
+        return m.group(1) + ", ".join(objects) + m.group(3) if changed > before else m.group(0)
+
+    return _ALLOCATE.sub(statement, source), changed
+
+
+def release_name(module: str, var: str, spec: "ReleaseSpec | None" = None) -> str:
+    """The release procedure of ``var`` of ``module``, one per member path (``spec``) of an array of records."""
+    suffix = "".join(f"_{component.lower()}" for component, _rank, _pointer in (spec.path if spec else ()))
+    return f"{RELEASE_PREFIX}{module.lower()}_{var.lower()}{suffix}"
+
+
+def _release_procedure(var: ExposedVariable, spec: ReleaseSpec, module: str) -> list[str]:
+    """``subroutine <release>() bind(c)``: see :class:`ReleaseSpec`."""
+    proc = release_name(module, var.name, spec)
+    lines = [f"subroutine {proc}() bind(c, name='{proc}')"]
+    present = _present_test(var)
+    if not spec.path:
+        ones = ", ".join(["1"] * var.rank)
+        lines += [f"    if ({present}) then",
+                  f"        !$acc exit data delete({var.name})",
+                  f"        deallocate({var.name})",
+                  f"        allocate({var.name}({ones}))",
+                  f"        !$acc enter data create({var.name})",
+                  "    end if"]
+        return [*lines, f"end subroutine {proc}"]
+    loops = var.rank + sum(rank for _c, rank, _p in spec.path[:-1])
+    if loops:
+        lines.append(f"    integer :: {', '.join(f'i{k}' for k in range(loops))}")
+    body: list[str] = []
+    depth = 0
+    expr = var.name
+    k = 0
+
+    def open_level(expr: str, rank: int, test: str) -> str:
+        nonlocal depth, k
+        body.append("    " * (depth + 1) + f"if ({test}) then")
+        depth += 1
+        indices = []
+        for _ in range(rank):
+            body.append("    " * (depth + 1) + f"do i{k} = lbound({expr}, {len(indices) + 1}), ubound({expr}, {len(indices) + 1})")
+            indices.append(f"i{k}")
+            depth += 1
+            k += 1
+        return f"{expr}({', '.join(indices)})" if indices else expr
+
+    expr = open_level(expr, var.rank, present)
+    for component, rank, pointer in spec.path[:-1]:
+        member = f"{expr}%{component}"
+        expr = open_level(member, rank, f"{'associated' if pointer else 'allocated'}({member})")
+    last, _rank, pointer = spec.path[-1]
+    member = f"{expr}%{last}"
+    body.append("    " * (depth + 1) + f"if ({'associated' if pointer else 'allocated'}({member})) then")
+    body.append("    " * (depth + 2) + f"!$acc exit data delete({member})")
+    body.append("    " * (depth + 1) + "end if")
+    # The constructs opened above (the innermost if is closed already), closed in reverse order.
+    opened = [l.strip().split(" ")[0] for l in body if l.strip().endswith("then") or l.strip().startswith("do ")][:-1]
+    lines += body
+    for construct in reversed(opened):
+        depth -= 1
+        lines.append("    " * (depth + 1) + ("end do" if construct == "do" else "end if"))
+    return [*lines, f"end subroutine {proc}"]
+
+
 class ModuleAccessError(ValueError):
     """The module or a requested variable cannot be made accessible."""
 
@@ -234,15 +336,32 @@ def c_accessor_association(var: ExposedVariable, accessor: str, pointer: str) ->
     ]
 
 
-def expose_module_variables(source: str, module: str, names: Sequence[str]) -> tuple[str, dict[str, ExposedVariable]]:
-    """``source`` with accessors to the variables ``names`` of ``module`` appended, and what each accessor returns.
+def expose_module_variables(source: str, module: str, names: Sequence[str],
+                            releases: Sequence[ReleaseSpec] = ()
+                            ) -> tuple[str, dict[str, ExposedVariable], list[ReleaseSpec]]:
+    """``source`` with accessors to the variables ``names`` of ``module`` appended, and what each accessor returns;
+    ``releases``: variables whose replaced storage a release procedure of the copy frees (:class:`ReleaseSpec`); one
+    with ``shrink_allocation`` has its allocate statements rewritten instead (:func:`shrink_allocations`), when found:
+    the third item returned lists those.
 
     :raises ModuleAccessError: the module is not in ``source``, a name is no variable declared in its specification
         part, is a named constant, or an accessor name is already taken.
     """
+    shrunk: list[ReleaseSpec] = []
+    for spec in releases:
+        if spec.shrink_allocation:
+            source, changed = shrink_allocations(source, spec)
+            if changed:
+                shrunk.append(spec)
+                print(f"{module}::{spec.name}{''.join('%' + c for c, _r, _p in spec.path)}: {changed} allocate "
+                      "statement(s) allocate one element per dimension", flush=True)
+            else:
+                print(f"{module}::{spec.name}: no allocate statement found to shrink; released after the "
+                      "initialisation instead", flush=True)
+    releases = [r for r in releases if r not in shrunk]
     lines = source.splitlines()
     start, end, contains = _module_span(lines, module)
-    wanted = {n.lower() for n in names}
+    wanted = {n.lower() for n in names} | {r.name.lower() for r in releases}
     found: dict[str, ExposedVariable] = {}
     targets: set[str] = set()  # declared with the target attribute already
     for statement in _statements(lines[start + 1 : contains if contains is not None else end]):
@@ -273,6 +392,7 @@ def expose_module_variables(source: str, module: str, names: Sequence[str]) -> t
     if missing:
         raise ModuleAccessError(f"no variable {missing} declared in the specification part of module {module!r}")
     variables = [found[n.lower()] for n in names]
+    released = [(found[r.name.lower()], r) for r in releases]
     taken = [
         name
         for v in variables
@@ -286,13 +406,17 @@ def expose_module_variables(source: str, module: str, names: Sequence[str]) -> t
     spec_lines = ["    ! ----- dace_fortran.bindings.module_access: accessors to otherwise private variables -----"]
     if needs_target:
         spec_lines.append(f"    target :: {', '.join(needs_target)}")
-    spec_lines.append(f"    public :: {', '.join(v.accessor for v in variables)}")
+    if variables:
+        spec_lines.append(f"    public :: {', '.join(v.accessor for v in variables)}")
+    if released:
+        spec_lines.append(f"    public :: {', '.join(release_name(module, v.name, r) for v, r in released)}")
     procedures = [f"    {line}" for v in variables for line in [*_accessor(v), *_c_accessor(v)]]
+    procedures += [f"    {line}" for v, spec in released for line in _release_procedure(v, spec, module)]
     if contains is None:
         out = [*lines[:end], *spec_lines, "contains", *procedures, *lines[end:]]
     else:
         out = [*lines[:contains], *spec_lines, *lines[contains:end], *procedures, *lines[end:]]
-    return "\n".join(out) + "\n", {v.name: v for v in variables}
+    return "\n".join(out) + "\n", {v.name: v for v in variables}, shrunk
 
 
 #: Words of a type spec that are no names to import: intrinsic types and type-parameter keywords.

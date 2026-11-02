@@ -39,8 +39,10 @@ from dace_fortran.bindings.loop_copy import (
     aos_bounds_locals,
     aos_kept_layout_locals,
     aos_pack_extent_locals,
+    aos_outer_rank,
     aos_pack_offset_locals,
     fortran_scalar_type,
+    own_shape_symbols,
     render_alias_calls,
     render_aos_alloc_members,
     render_aos_alloc_pack_in,
@@ -513,7 +515,7 @@ def build_wrapper_head(
             for name in elements.values()
         ]
         flat_ptr_lines.append(f"    logical :: {', '.join(aos_bounds_locals(r))}")
-        max_loop_rank = max(max_loop_rank, 1)
+        max_loop_rank = max(max_loop_rank, aos_outer_rank(r))
 
     # A free symbol that's also a frozen arg must use that arg's C type (e.g.
     # int64 extents) -- a hardcoded integer(c_int) local mismatches the bind(c) dummy.
@@ -551,12 +553,15 @@ def build_wrapper_head(
     declared_syms = set(frozen.free_symbols) | outer_dummy_set | flat_names | module_arg_names
     record_arrays = [*live_entries(frozen, plan), *(entry for entry, _ in split_entries(frozen, plan))]
     pack_only = sorted(
-        {
-            sym
-            for entry in record_arrays
-            if entry.recipe.aos_alloc
-            for sym in (*entry.recipe.cap_symbols, *entry.recipe.lb_symbols)
-        }
+        (
+            {
+                sym
+                for entry in record_arrays
+                if entry.recipe.aos_alloc
+                for sym in (*entry.recipe.cap_symbols, *entry.recipe.lb_symbols)
+            }
+            | own_shape_element_symbols(frozen)
+        )
         - declared_syms
     )
     if pack_only:
@@ -807,9 +812,11 @@ def build_wrapper_body(
                 copyin.append("    end if")
             else:
                 copyin.extend(lines)
+    own_shaped = {a.element_of for a in frozen.args if a.own_shape}
     for entry, elements in split_entries(frozen, plan):
         flag = DECLINED_FLAG if declinable else None
-        copyin.extend(render_aos_alloc_members(entry.recipe, entry.outer_expr, elements, flag))
+        copyin.extend(render_aos_alloc_members(entry.recipe, entry.outer_expr, elements, flag,
+                                               own_shape=entry.recipe.flat_names[0] in own_shaped))
 
     # Symbol population is SPLIT by data dependency: a shape sym from a module
     # global/dummy/constant must be assigned BEFORE the allocates below, while a
@@ -982,6 +989,61 @@ def build_wrapper_body(
 # ---------------------------------------------------------------------------
 
 
+def build_release(frozen: FrozenSignature, released: Container[str]) -> list[str]:
+    """Wrapper lines that, once the wrapper has served its first call, delete the caller's device copies of the module
+    arrays in ``released`` (SDFG names): the arrays the substitute holds as transients or kept buffers of its own,
+    which no code outside the routine reads or writes (the scratch and kept analyses), and whose device memory the
+    caller would otherwise hold for the whole run beside the substitute's. The host arrays stay as they are: the
+    caller's own finalisation finds them allocated, and its deletes of what is no longer present do nothing. A
+    member of an array of records goes element by element; a plain module array, which has no argument left once
+    it is a transient, through its import. The lines go before the SDFG's initialisation, which allocates its
+    transients: into the memory released."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for a in [*frozen.args, *frozen.shape_only_args]:
+        if a.sdfg_name not in released:
+            continue
+        seen.add(a.sdfg_name)
+        if getattr(a, "aos_origin_struct", ""):
+            if _aos_member_is_static(a):
+                continue
+            pieces = _aos_loop_pieces(a)
+            elem = pieces.accessor
+            present = _present(elem, a.aos_member_pointer)
+            if not _aos_lead(a):
+                out += [f"    if ({present}) then", f"      !$acc exit data delete({elem})", "    end if"]
+                continue
+            loops = _aos_loops(a, pieces)
+            out += [f"    if ({loops.present}) then", *loops.do_open, f"        if ({present}) then",
+                    f"          !$acc exit data delete({elem})", "        end if", *loops.do_close, "    end if"]
+        elif a.sdfg_name in frozen.module_symbol_origins:
+            alias = _module_symbol_alias(a.sdfg_name)
+            out += [f"    if ({_present(alias, a.module_origin_pointer)}) then",
+                    f"      !$acc exit data delete({alias})", "    end if"]
+    for name in sorted(n for n in released if n not in seen and n in frozen.module_symbol_origins):
+        alias = _module_symbol_alias(name)  # allocated(): the module's copy of a private one is rewritten to a pointer
+        out += [f"    if (allocated({alias})) then", f"      !$acc exit data delete({alias})", "    end if"]
+    if not out:
+        return []
+    return ["    ! ----- Release: the caller's device copies of the arrays the substitute holds itself, once -----",
+            "    if (init_count == 0) then", *_memory_report("before the release"), *out,
+            *_memory_report("after the release"), "    end if"]
+
+
+def _memory_report(when: str) -> list[str]:
+    """Lines writing the device memory in use (OpenACC's device properties) to the error unit."""
+    return ["    block",
+            "      integer(c_size_t) :: dace_mem_total, dace_mem_free",
+            "      integer(acc_device_kind) :: dace_dev_type",
+            "      dace_dev_type = acc_get_device_type()",
+            "      dace_mem_total = acc_get_property(acc_get_device_num(dace_dev_type), dace_dev_type, acc_property_memory)",
+            "      dace_mem_free = acc_get_property(acc_get_device_num(dace_dev_type), dace_dev_type, &",
+            "        acc_property_free_memory)",
+            f"      write(0, '(a, f0.2, a, f0.2, a)') 'device memory in use {when}: ', &",
+            "        real(dace_mem_total - dace_mem_free) / 2.0**30, ' GB of ', real(dace_mem_total) / 2.0**30, ' GB'",
+            "    end block"]
+
+
 def build_wrapper_tail(
     frozen: FrozenSignature,
     iface: OriginalInterface,
@@ -993,12 +1055,14 @@ def build_wrapper_tail(
     acc_residency: AccTransferPlan | None = None,
     kept: Container[str] = frozenset(),
     members_first: Container[str] = frozenset(),
+    released: Container[str] = frozenset(),
 ) -> str:
     """Render the wrapper tail: init-count bump + call dace_program_<entry> +
     copy-back for every non-aliased writeable entry, then deallocate + close.
     Template templates/wrapper_call.f90.in supplies the skeleton; we splice the
     copy-back block in before its end marker.  A buffer in ``kept`` stays as it is for the next call: no copy-back,
-    no release; one in ``members_first`` is unpacked in its permuted layout (see :func:`emit_bindings`)."""
+    no release; one in ``members_first`` is unpacked in its permuted layout (see :func:`emit_bindings`); the caller's
+    device copies of the arrays in ``released`` go after the first call (:func:`build_release`)."""
     tpl = _load("wrapper_call.f90.in")
     deviceptr, device_pack = _device_lane(acc_residency)
 
@@ -1112,6 +1176,10 @@ def build_wrapper_tail(
             module_writeback_lines
         )
 
+    release_lines = build_release(frozen, set(released))
+    if release_lines:
+        init = "    ! Ref-counted init -- first call allocates, subsequent calls reuse."
+        call_block = call_block.replace(init, "\n".join([*release_lines, "", init]), 1)
     if not copy_out_lines and not module_writeback_lines and not aos_out_lines:
         return call_block
 
@@ -1315,8 +1383,9 @@ def assemble_module(
         return True
 
     use_lines = [f"  use {mod}, only: {', '.join(syms)}" for mod, syms in sorted(iface.used_modules.items())]
-    if acc_residency is not None and acc_residency.deviceptr:
-        use_lines.append("  use openacc, only: acc_deviceptr")
+    if acc_residency is not None and (acc_residency.deviceptr or acc_residency.device_pack):
+        use_lines.append("  use openacc, only: acc_deviceptr, acc_get_property, acc_get_device_type, acc_get_device_num, &")
+        use_lines.append("    acc_property_memory, acc_property_free_memory, acc_device_kind, acc_is_present")
     # Module-sourced free symbols: import each member under a <sym>__mod alias so
     # it doesn't clash with the wrapper's own local <sym>. Group by module.
     sources = {**(extra_sources or {}), **effective_module_sources(frozen, iface, plan)}
@@ -1638,6 +1707,12 @@ def _module_arg_may_be_unallocated(a: FrozenArg) -> bool:
     return (a.module_origin_allocatable or a.module_origin_pointer) and not a.global_alloc_inside and a.rank > 0
 
 
+def _on_device(expr: str, present: str) -> str:
+    """``present`` (the member is associated/allocated) and its device copy exists: the caller may have freed the
+    device copy of a member it keeps on the host (a release after its initialisation)."""
+    return f"{present} .and. acc_is_present({expr})"
+
+
 def _present(expr: str, is_pointer: bool) -> str:
     """Definedness test for a POINTER (``associated``) vs ALLOCATABLE
     (``allocated``) -- using the wrong intrinsic is a hard Fortran type error."""
@@ -1655,14 +1730,20 @@ def live_entries(frozen: FrozenSignature, plan: FlattenPlan) -> list:
     return [e for e in plan.entries if any(f in live_names for f in e.recipe.flat_names)]
 
 
-def split_entries(frozen: FrozenSignature, plan: FlattenPlan) -> list[tuple[FlattenEntry, dict[int, str]]]:
+def own_shape_element_symbols(frozen: FrozenSignature) -> set[str]:
+    """The extents and lower bounds of the elements split with their own shapes, which the binding takes off each
+    member (:func:`dace_fortran.bindings.loop_copy.own_shape_symbols`)."""
+    return {s for a in frozen.args if a.own_shape for group in own_shape_symbols(a.sdfg_name, a.rank) for s in group}
+
+
+def split_entries(frozen: FrozenSignature, plan: FlattenPlan) -> list[tuple[FlattenEntry, dict]]:
     """Arrays of records whose packed companion split into one argument per element
     (:func:`dace_fortran.bindings.record_split.split_record_companions`), each with those arguments by element
-    index."""
-    elements: dict[str, dict[int, str]] = {}
+    index (by the tuple of indices, for elements split with their own shapes)."""
+    elements: dict[str, dict] = {}
     for a in frozen.args:
         if a.element_of:
-            elements.setdefault(a.element_of, {})[a.element_index] = a.sdfg_name
+            elements.setdefault(a.element_of, {})[a.element_indices if a.own_shape else a.element_index] = a.sdfg_name
     return [
         (e, elements[e.recipe.flat_names[0]])
         for e in plan.entries
@@ -1772,7 +1853,7 @@ def _shape_only_bounds(a: FrozenArg) -> list[str]:
     """The lines taking, on the host, the bounds of the image ``a`` the SDFG allocates itself, as
     :func:`_render_aos_copy_in` lays a packed image out: under a root array of records the largest segment over the
     root's elements, and each member dim spanning every present element's bounds, from the smallest lower to the
-    largest upper (the elements differ: MFC's fluxes keep each direction's own axis first)."""
+    largest upper (the elements may differ: fluxes kept per direction, each with its own axis first)."""
     pieces = _aos_loop_pieces(a)
     loops = _aos_loops(a, pieces)
     elem = pieces.accessor
@@ -2155,7 +2236,7 @@ def _render_aos_copy_in(
         out += do_open
         if device:
             member_idx = ", ".join(pieces.member_loop_vars)
-            out.append(f"        if ({mp}) then")
+            out.append(f"        if ({_on_device(elem, mp)}) then")
             out += _device_member_loop(pieces, f"{a.sdfg_name}({_buffer_spec(idx, member_idx, members_first)}) = {elem}({member_idx})")
             out.append("        end if")
         else:
@@ -2242,7 +2323,7 @@ def _render_aos_copy_out(a: FrozenArg, device: bool = False, members_first: bool
         out.append(f"        if (.not. {mp}) allocate({elem}({alloc_dims}))")
     if device:
         member_idx = ", ".join(pieces.member_loop_vars)
-        out.append(f"        if ({mp}) then")
+        out.append(f"        if ({_on_device(elem, mp)}) then")
         out += _device_member_loop(pieces, f"{elem}({member_idx}) = {a.sdfg_name}({_buffer_spec(idx, member_idx, members_first)})")
         out.append("        end if")
     else:
@@ -2373,7 +2454,7 @@ def _build_symbol_assigns(
         for entry in plan.entries
         if entry.recipe.aos_alloc
         for sym in (*entry.recipe.cap_symbols, *entry.recipe.lb_symbols)
-    }
+    } | own_shape_element_symbols(frozen)
     # <flat>_d<i> is the i-th extent of the flat companion <flat> -- must take
     # that entry's shape_exprs[i] (substring-scanning mis-binds on a multi-member struct).
     flat_shapes: dict = {}

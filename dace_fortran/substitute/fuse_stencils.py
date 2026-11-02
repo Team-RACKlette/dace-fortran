@@ -18,6 +18,8 @@ import ast
 import re
 from typing import Iterable
 
+import networkx as nx
+
 import dace
 from dace import symbolic
 from dace.properties import CodeBlock
@@ -224,16 +226,78 @@ def _movable_past(edge, sdfg: dace.SDFG) -> bool:
     return not reads & (set(sdfg.arrays) | assigned)
 
 
+def _mapless_components(state: dace.SDFGState) -> list[set]:
+    """The weakly connected components of ``state`` that hold no top-level map."""
+    tops = set(_top_maps(state))
+    return [c for c in nx.weakly_connected_components(state.nx) if not c & tops]
+
+
+def _move_nodes(source: dace.SDFGState, target: dace.SDFGState, moved: set) -> None:
+    """Move the nodes ``moved`` (whole components of ``source``) and their edges into ``target``."""
+    edges = [e for e in source.edges() if e.src in moved]
+    for n in moved:
+        target.add_node(n)
+    for e in edges:
+        target.add_edge(e.src, e.src_conn, e.dst, e.dst_conn, e.data)
+    for n in moved:
+        source.remove_node(n)
+
+
+def _fuse_states(sdfg: dace.SDFG, first: dace.SDFGState, second: dace.SDFGState) -> bool:
+    """Fuse ``second`` into ``first``. Where state fusion refuses, it is tried once more with the components of either
+    state that hold no top-level map out of the way: those of ``first`` in a state before it, those of ``second`` in
+    one after it. Nodes of different components are unordered, so either order is the state's own. What they hold
+    (the element copies of a record assignment, split over the states by the unrolling) may race with the other state
+    and make state fusion refuse, though the maps' dataflow allows it. If the moves do not help, the components go
+    back. Returns whether the states fused."""
+    graph = first.parent_graph
+    fusion = StateFusion()
+    fusion.first_state, fusion.second_state = first, second
+    if not fusion.can_be_applied(graph, 0, sdfg):
+        before, after = _mapless_components(first), _mapless_components(second)
+        if not before and not after:
+            return False
+        head = graph.add_state_before(first, f"{first.label}_apart", is_start_block=graph.start_block is first) \
+            if before else None
+        tail = graph.add_state_after(second, f"{second.label}_apart") if after else None
+        for comps, source, target in ((before, first, head), (after, second, tail)):
+            for comp in comps:
+                _move_nodes(source, target, comp)
+        if not fusion.can_be_applied(graph, 0, sdfg):
+            if head is not None:
+                _move_nodes(head, first, set(head.nodes()))
+                for e in graph.in_edges(head):
+                    graph.add_edge(e.src, first, e.data)
+                was_start = graph.start_block is head
+                graph.remove_node(head)
+                if was_start:
+                    graph.start_block = graph.node_id(first)
+            if tail is not None:
+                _move_nodes(tail, second, set(tail.nodes()))
+                for e in graph.out_edges(tail):
+                    graph.add_edge(second, e.dst, e.data)
+                graph.remove_node(tail)
+            return False
+    # annotate=False: fuse_stencil_pairs propagates the memlets once after all the joins (apply_to would propagate the
+    # whole SDFG after each).
+    StateFusion.apply_to(sdfg, first_state=first, second_state=second, verify=False, annotate=False)
+    return True
+
+
 def join_stencil_states(sdfg: dace.SDFG) -> int:
     """Fuse each state holding a stencil's consumer into its producer's state where only symbol assignments keep them
     apart (loop bounds of later code a source sets between the two, say: a value known only at run time stays an
     assignment, a constant would have been propagated): the values replace the symbols in the consumer's state and in
     the conditions and values of the edges out of it, the assignments move onto those edges (one that assigns a symbol
-    again keeps its own value), the two states fuse, and the stencil fusion sees the pair. Returns the number of
-    states joined."""
+    again keeps its own value), the two states fuse, and the stencil fusion sees the pair. States nothing is assigned
+    between and that fuse as they are, the simplification has fused; those it could not fuse, and those an assignment
+    separated, fuse once what neither map touches is out of the way if that is what kept them apart
+    (:func:`_fuse_states`). Returns the number of states joined."""
     joined = 0
     for state in list(sdfg.states()):
         graph = state.parent_graph
+        if state not in graph.nodes():
+            continue  # fused into the state before it as a consumer's
         tops = set(_top_maps(state))
         written = {n.data for n in state.data_nodes() if sdfg.arrays[n.data].transient and state.in_degree(n) == 1
                    and isinstance(state.in_edges(n)[0].src, nodes.MapExit)
@@ -245,18 +309,22 @@ def join_stencil_states(sdfg: dace.SDFG) -> int:
         if not isinstance(after, dace.SDFGState) or not any(n.data in written and after.out_degree(n)
                                                             for n in after.data_nodes()):
             continue
+        if not edge.data.assignments:
+            plain = StateFusion()
+            plain.first_state, plain.second_state = state, after
+            if (edge.data.is_unconditional() and graph.in_degree(after) == 1
+                    and not plain.can_be_applied(graph, 0, sdfg) and _fuse_states(sdfg, state, after)):
+                joined += 1
+            continue
         if not _movable_past(edge, sdfg):
-            continue  # states nothing is assigned between are the simplification's to fuse
+            continue
         values = dict(edge.data.assignments)
         after.replace_dict(values)
         for out in graph.out_edges(after):
             out.data.replace_dict(values, replace_keys=False)
             out.data.assignments = {**values, **out.data.assignments}
         edge.data.assignments = {}
-        fusion = StateFusion()
-        fusion.first_state, fusion.second_state = state, after
-        if fusion.can_be_applied(graph, 0, sdfg):
-            StateFusion.apply_to(sdfg, first_state=state, second_state=after, verify=False)
+        if _fuse_states(sdfg, state, after):
             joined += 1
     return joined
 

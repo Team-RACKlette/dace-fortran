@@ -15,15 +15,19 @@ keeps that order with empty edges (see :func:`_keep_order`).
 
 from __future__ import annotations
 
+import ast
 import copy
 import math
+import re
+from collections.abc import Callable, Iterator, Sequence
 
 import dace
 import networkx as nx
 import sympy
-from dace import subsets
+from dace import subsets, symbolic
+from dace.properties import CodeBlock
 from dace.sdfg import nodes
-from dace.sdfg.state import AbstractControlFlowRegion
+from dace.sdfg.state import AbstractControlFlowRegion, ConditionalBlock, LoopRegion
 
 #: An edge that touches the array without telling which part of it.
 _UNKNOWN = object()
@@ -51,12 +55,80 @@ def _constant(rng) -> int | None:
     return None
 
 
-def constant_indices(sdfg: dace.SDFG, name: str, dim: int = 0) -> set[int] | None:
+def _code_texts(sdfg: dace.SDFG) -> Iterator[tuple[str, Callable[[str], None]]]:
+    """Every piece of control-flow code of ``sdfg`` (not of its nested SDFGs), with a function that puts a rewritten
+    text in its place: interstate conditions and assignments, branch conditions, loop headers."""
+    for edge in sdfg.all_interstate_edges():
+        data = edge.data
+        yield data.condition.as_string, lambda t, d=data: setattr(d, "condition", CodeBlock(t, d.condition.language))
+        for key, value in data.assignments.items():
+            yield str(value), lambda t, d=data, k=key: d.assignments.__setitem__(k, t)
+    for block in sdfg.all_control_flow_blocks():
+        if isinstance(block, ConditionalBlock):
+            for i, (cond, body) in enumerate(block.branches):
+                if cond is not None:
+                    yield (
+                        cond.as_string,
+                        lambda t, b=block, i=i, c=cond, r=body: b.branches.__setitem__(
+                            i, (CodeBlock(t, c.language), r)
+                        ),
+                    )
+        elif isinstance(block, LoopRegion):
+            for attr in ("loop_condition", "init_statement", "update_statement"):
+                code = getattr(block, attr)
+                if code is not None:
+                    yield code.as_string, lambda t, b=block, a=attr, c=code: setattr(b, a, CodeBlock(t, c.language))
+
+
+def _subscripts(text: str, name: str) -> list[list[str]] | None:
+    """The indices of every subscript of ``name`` in the code ``text``, each as code; None if the code names the array
+    otherwise (whole, as an argument, say) or cannot be parsed."""
+    if not re.search(rf"\b{re.escape(name)}\b", text):
+        return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    found, named = [], 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == name:
+            named += 1
+        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == name:
+            elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            found.append([ast.unparse(e) for e in elts])
+    return found if named == len(found) else None
+
+
+def _rewrite_subscripts(text: str, name: str, rewrite: Callable[[list[str]], str]) -> str:
+    """``text`` with each subscript of ``name`` replaced by the code ``rewrite`` makes of its indices."""
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Subscript(self, node):
+            self.generic_visit(node)
+            if isinstance(node.value, ast.Name) and node.value.id == name:
+                elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                return ast.parse(rewrite([ast.unparse(e) for e in elts]), mode="eval").body
+            return node
+
+    return ast.unparse(Rewriter().visit(ast.parse(text)))
+
+
+def _literal(code: str) -> int | None:
+    """The integer an index expression evaluates to (``1 - 1`` after an unrolling), or None."""
+    try:
+        value = symbolic.simplify(symbolic.pystr_to_symbolic(code))
+    except Exception:  # anything unparsable is no literal
+        return None
+    return int(value) if getattr(value, "is_Integer", False) else None
+
+
+def constant_indices(sdfg: dace.SDFG, name: str, dim: int = 0, code: bool = False) -> set[int] | None:
     """The indices of dimension ``dim`` the accesses of the array ``name`` use, or None unless each of them is one
     literal.
 
-    Only the outermost SDFG is looked at: an array a nested SDFG takes, or one an interstate edge or a loop or branch
-    condition reads, does not qualify.
+    Only the outermost SDFG is looked at: an array a nested SDFG takes does not qualify. Neither does one an
+    interstate edge or a loop or branch condition reads, unless ``code``: then those reads count as accesses, and any
+    other mention of the array in that code (not subscripted) disqualifies it.
     """
     if not isinstance(sdfg.arrays.get(name), dace.data.Array):
         return None
@@ -77,6 +149,17 @@ def constant_indices(sdfg: dace.SDFG, name: str, dim: int = 0) -> set[int] | Non
             if index is None:
                 return None
             indices.add(index)
+    if code:
+        for text, _put in _code_texts(sdfg):
+            found = _subscripts(text, name)
+            if found is None:
+                return None
+            for index in found:
+                literal = _literal(index[dim]) if dim < len(index) else None
+                if literal is None:
+                    return None
+                indices.add(literal)
+        return indices
     for edge in sdfg.all_interstate_edges():
         if any(m.data == name for m in edge.data.get_read_memlets(sdfg.arrays)):
             return None
@@ -118,17 +201,17 @@ def _keep_order(state: dace.SDFGState, parts: list[nodes.AccessNode]) -> None:
                 state.add_nedge(part, edge.dst, dace.Memlet())
 
 
-def split_array(sdfg: dace.SDFG, name: str, dim: int = 0) -> dict[int, str] | None:
+def split_array(sdfg: dace.SDFG, name: str, dim: int = 0, code: bool = False) -> dict[int, str] | None:
     """Replace the array ``name`` by one array per index of dimension ``dim`` its accesses use, named
     ``<name>_<index>``, and return them by index; None (and ``sdfg`` unchanged) unless :func:`constant_indices` finds
-    every index a literal.
+    every index a literal. ``code``: the subscripts in control-flow code are accesses too (see there), rewritten alike.
 
     Each new array has the remaining dimensions of ``name``, laid out column-major on their own: a caller hands it
     over as the contiguous array it is, not as a slice of the original.  A transient with no dimension left becomes a
     scalar.  Edges that carry no data (they only order their ends) may touch the array's nodes: each part of a node
     keeps them.
     """
-    indices = constant_indices(sdfg, name, dim)
+    indices = constant_indices(sdfg, name, dim, code)
     if not indices:
         return None
     names = {k: f"{name}_{k}" for k in sorted(indices)}
@@ -190,5 +273,58 @@ def split_array(sdfg: dace.SDFG, name: str, dim: int = 0) -> dict[int, str] | No
             if memlet.data == name:
                 memlet.data = names[_constant(memlet.subset[dim])]
                 memlet.subset = _without(memlet.subset, dim, scalar)
+    if code:
+
+        def part(index: list[str]) -> str:
+            rest = [i for d, i in enumerate(index) if d != dim]
+            return f"{names[_literal(index[dim])]}[{', '.join(rest)}]" if rest else names[_literal(index[dim])]
+
+        for text, put in list(_code_texts(sdfg)):
+            if _subscripts(text, name):
+                put(_rewrite_subscripts(text, name, part))
     sdfg.remove_data(name, validate=False)
     return names
+
+
+def rebase(sdfg: dace.SDFG, name: str, shape: Sequence, shift: Sequence) -> None:
+    """Give the array ``name`` the extents ``shape`` (laid out column-major) and move its index origin: an access at
+    index ``i`` of dimension ``k`` addresses ``i + shift[k]`` afterwards. Where :func:`split_array` cut an array of
+    records into its elements, an element counted from the lower bounds all of them shared then counts from its own.
+    The accesses of the outermost SDFG and the subscripts in its control-flow code are rewritten (an array a nested
+    SDFG takes is not handled)."""
+    shape = [symbolic.pystr_to_symbolic(str(s)) for s in shape]
+    shift = [symbolic.pystr_to_symbolic(str(s)) for s in shift]
+    desc = sdfg.arrays[name]
+    desc.set_shape(
+        shape,
+        strides=[math.prod(shape[:i]) for i in range(len(shape))],
+        total_size=math.prod(shape),
+        offset=[0] * len(shape),
+    )
+
+    def moved(rng: subsets.Range) -> subsets.Range:
+        return subsets.Range(
+            [
+                (symbolic.simplify(b + s), symbolic.simplify(e + s), st)
+                for (b, e, st), s in zip(rng.ndrange(), shift, strict=True)
+            ]
+        )
+
+    for state in sdfg.states():
+        for edge in state.edges():
+            memlet = edge.data
+            if memlet.is_empty():
+                continue
+            if memlet.data == name:
+                memlet.subset = moved(memlet.subset)
+            elif memlet.other_subset is not None and any(
+                isinstance(end, nodes.AccessNode) and end.data == name for end in (edge.src, edge.dst)
+            ):
+                memlet.other_subset = moved(memlet.other_subset)
+
+    def at(index: list[str]) -> str:
+        return f"{name}[{', '.join(str(symbolic.simplify(symbolic.pystr_to_symbolic(i) + s)) for i, s in zip(index, shift, strict=True))}]"
+
+    for text, put in list(_code_texts(sdfg)):
+        if _subscripts(text, name):
+            put(_rewrite_subscripts(text, name, at))

@@ -115,6 +115,11 @@ class FrozenArg:
     # dace_fortran.array_split split the companion, and the binding passes that element's member itself.
     element_of: str = ""
     element_index: int = 0
+    # An element split with a shape of its own (``own_shape``): its indices, one per record dimension (0-based), and
+    # the SDFG addresses the member with its own extents and lower bounds, the symbols
+    # dace_fortran.bindings.loop_copy.own_shape_symbols names, which the binding takes off the member.
+    element_indices: tuple[int, ...] = ()
+    own_shape: bool = False
 
     @property
     def acc_data_clause(self) -> str:
@@ -134,9 +139,10 @@ class FrozenArg:
         return "copy"
 
     def to_dict(self) -> dict:
-        """Serialise to a JSON-safe dict (``shape`` tuple becomes a list)."""
+        """Serialise to a JSON-safe dict (the ``shape`` and ``element_indices`` tuples become lists)."""
         d = asdict(self)
         d["shape"] = list(self.shape)
+        d["element_indices"] = list(self.element_indices)
         d["kind"] = self.kind.value
         return d
 
@@ -146,6 +152,7 @@ class FrozenArg:
         d = dict(d)
         d["shape"] = tuple(d.get("shape", []))
         d["kind"] = FrozenArgKind(d["kind"])
+        d["element_indices"] = tuple(d.get("element_indices", ()))
         return cls(**d)
 
 

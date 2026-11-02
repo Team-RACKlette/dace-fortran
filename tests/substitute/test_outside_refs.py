@@ -243,3 +243,15 @@ end module m_esc
     v = outside_readers(prog, ("m_esc", "s_rhs"), [("m_esc", "buf")])
     assert not v[("m_esc", "buf")].scratch
     assert "s_keep" in v[("m_esc", "buf")].reasons[0]
+
+
+def test_arrays_written_outside_keep_their_allocation(tmp_path: Path):
+    from dace_fortran.bindings.module_access import ReleaseSpec
+    from dace_fortran.substitute.make_substitute import keep_written_allocations
+
+    prog = _program(tmp_path, _FIELDS)
+    groups = {("m_fields", "s_init"): {"m_fields": [ReleaseSpec("work", shrink_allocation=True),
+                                                    ReleaseSpec("written_outside", shrink_allocation=True)]}}
+    kept = keep_written_allocations(prog, "m_fields::s_rhs", [], groups)
+    assert kept[("m_fields", "s_init")]["m_fields"] == [ReleaseSpec("work", shrink_allocation=True),
+                                                         ReleaseSpec("written_outside", shrink_allocation=False)]

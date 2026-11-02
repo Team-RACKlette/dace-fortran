@@ -89,6 +89,7 @@ def _module_record_members(frozen: FrozenSignature) -> list[list[str]]:
         _aos_loops,
         _aos_member_is_static,
         _aos_module_args,
+        _aos_root_and_segment,
         _present,
     )
 
@@ -107,8 +108,16 @@ def _module_record_members(frozen: FrozenSignature) -> list[list[str]]:
         pieces = _aos_loop_pieces(a)
         loops = _aos_loops(a, pieces)
         member = pieces.accessor
-        # The alias record names the element of a rank-1 array of records (the one case it folds).
-        elem = pieces.loop_vars[0] if _aos_lead(a) == 1 and not a.aos_root_rank else "0"
+        # The alias record names the element of a rank-1 array of records, and of a segment under a root array of
+        # records (``flux(d)%vf(l)``) as one index: the root's element times the segment's size, plus the segment's.
+        if _aos_lead(a) == 1 and not a.aos_root_rank:
+            elem = pieces.loop_vars[0]
+        elif _aos_lead(a) == 2 and a.aos_root_rank == 1:
+            root, segment = _aos_root_and_segment(a)
+            i0, i1 = pieces.loop_vars
+            elem = f"({i0} - 1) * size({root}({i0})%{segment}, 1) + {i1}"
+        else:
+            elem = "0"
         inner = _guarded([_present(member, a.aos_member_pointer)],
                          [_span_add(member, member_rank, kind, a.sdfg_name if elem != "0" else "", elem)])
         # The element loops of the copy-in, without its prelude (that sizes the buffer).
@@ -246,15 +255,19 @@ def build_storage_guard(
     return lines
 
 
-def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, path) -> list[str]:
+def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: FlattenPlan, path,
+                       per_rank: bool = False) -> list[str]:
     """Wrapper lines of a sizing run appending, to ``<path>.aliases``, a line ``alias <image> <element> <array>`` for
     every member of an element of a rank-1 module array of records (``<image>`` its SDFG image, ``<element>`` the
     0-based element) whose storage is exactly that of a module array or array dummy the SDFG takes in place
     (``<array>``), a line ``same <image> <element> <image> <element>`` for every two such members with the same
-    storage, and an empty line that ends the call.  The substitute built from the record takes the two as one array
-    (``fold_aliases``), which the storage guard would otherwise decline.  Empty when the SDFG takes no such
-    member."""
+    storage, a line ``member <image> <element>`` for every such member present, and an empty line that ends the call.
+    The substitute built from the record takes the two as one array (``fold_aliases``), which the storage guard would
+    otherwise decline.  Empty when the SDFG takes no such member.  ``per_rank``: a process an MPI launcher started
+    writes ``<path>.aliases.<rank>`` instead (as the symbol record does), so the ranks' lines do not interleave."""
     from pathlib import Path
+
+    from dace_fortran.bindings.specialization import record_open_lines
 
     _NAMES.clear()
     module_members = _module_record_members(frozen)
@@ -274,9 +287,11 @@ def build_alias_record(frozen: FrozenSignature, iface: OriginalInterface, plan: 
         f"{_INDENT}    ]",
         f"{_INDENT}  {_COUNT} = 0",
     ]
+    declarations, opening = record_open_lines("dace_alias_unit", f"'{Path(path)}.aliases'", per_rank)
+    lines[3:3] = [f"{_INDENT}  {ln}" for ln in declarations]
     lines += [f"{_INDENT}  {ln}" for group in groups for ln in group]
     lines += [
-        f"{_INDENT}  open(newunit=dace_alias_unit, file='{Path(path)}.aliases', position='append', action='write')",
+        *(f"{_INDENT}  {ln}" for ln in opening),
         f"{_INDENT}  call dace_spans_aliases({_SPANS}, {_COUNT}, dace_alias_unit, dace_span_sdfg)",
         f"{_INDENT}  write(dace_alias_unit, '(a)') ''",
         f"{_INDENT}  close(dace_alias_unit)",
@@ -326,6 +341,7 @@ STORAGE_GUARD_HELPERS = """\
     do i = 1, n
       if (spans(3, i) > 2 .or. spans(5, i) < 1) cycle
       if (len_trim(names(int(spans(4, i)))) == 0) cycle
+      write(unit, '(a, 1x, a, 1x, i0)') 'member', trim(names(int(spans(4, i)))), int(spans(5, i)) - 1
       do j = 1, n
         if (len_trim(names(int(spans(4, j)))) == 0) cycle
         if (spans(1, i) /= spans(1, j) .or. spans(2, i) /= spans(2, j)) cycle

@@ -44,7 +44,7 @@ def test_shape_only_image_survives_the_snapshot():
 
 
 def test_shape_only_extents_span_every_element_under_a_root_array_of_records(tmp_path):
-    """MFC's flux_n(dir)%vf(var)%sf: the root's dims, then the largest segment, then each member dim spanning every
+    """Fluxes kept per direction, ``flux_n(dir)%vf(var)%sf``: the root's dims, then the largest segment, then each member dim spanning every
     element's bounds -- the directions' elements differ (each keeps its own axis first), so the first element's
     would not hold the others. Compiled and run against such records."""
     image = FrozenArg(

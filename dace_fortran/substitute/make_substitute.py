@@ -26,6 +26,7 @@ device copies (dace_fortran.bindings.acc_transfers.plan_device_resident_caller).
 import argparse
 import functools
 import json
+import shutil
 from dataclasses import replace
 import re
 import sys
@@ -36,6 +37,7 @@ from pathlib import Path
 
 import dace
 from dace.sdfg import infer_types, nodes
+from dace.sdfg.propagation import propagate_memlets_sdfg
 from dace.transformation.dataflow import MapCollapse, MapDimShuffle
 from dace.transformation.passes.parallelization_prep import ShortLoopUnroll
 from dace.transformation.passes.persistent_transients import MakeTransientsPersistent
@@ -190,8 +192,13 @@ def order_for_coalescing(sdfg: dace.SDFG) -> int:
             # Stable: parameters with equally many stride-1 subscripts keep their order.
             order = sorted(params, key=lambda p: counts.get(p, 0))
             if order != params:
-                MapDimShuffle.apply_to(sdfg, map_entry=entry, options={"parameters": order}, save=False)
+                # annotate=False: apply_to would otherwise propagate the memlets of the whole SDFG after every map
+                # (a minute each on a large routine); once after all of them gives the same memlets.
+                MapDimShuffle.apply_to(sdfg, map_entry=entry, options={"parameters": order}, save=False,
+                                       annotate=False)
                 reordered += 1
+    if reordered:
+        propagate_memlets_sdfg(sdfg)
     return reordered
 
 
@@ -463,15 +470,24 @@ def image_symbols(name: str, desc, values: dict) -> dict:
     return out
 
 
-def finish_scratch_images(sdfg: dace.SDFG, images: dict[str, dict]) -> None:
+def finish_scratch_images(sdfg: dace.SDFG, images: dict[str, dict], aliases: list = (),
+                          present: set | frozenset = frozenset()) -> None:
     """Make the packed record images ``images`` (name -> recorded shape and offset symbol values) transients: they
     leave the frozen signature (no longer arguments the binding packs), their symbols take the recorded values, and
     they are laid out with the field dimensions contiguous. A symbol without a recorded value (an extent that differs
-    between the ranks of a run) stays one the binding reads off the record (``shape_only_args``)."""
+    between the ranks of a run) stays one the binding reads off the record (``shape_only_args``). An image whose
+    record slots the program associates with the first (``aliases`` and ``present``, the sizing run's alias record)
+    keeps one slot (:func:`fold_aliases.fold_record_slots`)."""
+    from dace_fortran.substitute.fold_aliases import fold_record_slots  # noqa: PLC0415
+    from dace_fortran.substitute.scratch_extents import shrink_record_ranges  # noqa: PLC0415
+
     if not images:
         return
+    from dace_fortran.bindings.block_builders import _aos_lead  # noqa: PLC0415
+
     frozen = get_frozen_signature(sdfg)
     gone = tuple(a for a in frozen.args if a.sdfg_name in images)
+    record_dims = {a.sdfg_name: _aos_lead(a) for a in gone}
     attach_to_sdfg(sdfg, replace(frozen, args=tuple(a for a in frozen.args if a not in gone),
                                  shape_only_args=frozen.shape_only_args + gone))
     fold = {}
@@ -481,6 +497,10 @@ def finish_scratch_images(sdfg: dace.SDFG, images: dict[str, dict]) -> None:
     if fold:
         specialize(sdfg, symbols=fold)
     print(f"scratch images made transient: {sorted(images)}; symbols fixed: {fold}", flush=True)
+    if aliases:
+        print(f"record slots folded into the first, as the program associates them: "
+              f"{fold_record_slots(sdfg, record_dims, aliases, set(present))}", flush=True)
+    print(f"scratch images cut to the elements accessed: {shrink_record_ranges(sdfg, record_dims)}", flush=True)
     print(f"scratch arrays laid out with the field dimensions contiguous: {relayout_field_last(sdfg, sorted(images))}", flush=True)
 
 
@@ -560,7 +580,7 @@ def heavy_innermost_loop(min_tasklets: int, limit: int = UNROLL_LIMIT):
 
 def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scalars: dict,
                          keep_heavy_loops: int = 0, arrays: dict | None = None,
-                         rank_values: list[dict] | None = None) -> dict[str, dict[int, str]]:
+                         rank_values: list[dict] | None = None, own_shapes: bool = False) -> dict[str, dict]:
     """Specialise ``sdfg`` and split the arrays of records its element loops then index by constants.
 
     Constant propagation and dead-branch elimination come first: a loop bound computed from a specialised value is a
@@ -569,7 +589,8 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
     ``arrays``: small integer module arrays and their elements (recorded_arrays): once the short loops are unrolled,
     their element reads in control flow are literals (an equation index ``rs(k)`` the loop over ``k`` reads).
     ``rank_values``: each rank's combination of the values that differ between the ranks (the binding admits these
-    only).
+    only). ``own_shapes``: arrays of records the split leaves packed go element by element with their own shapes
+    where they can (record_split.split_record_companions).
     """
     specialize(sdfg, symbols=symbols, scalars=scalars)
     for node, _ in sdfg.all_nodes_recursive():
@@ -590,7 +611,7 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
             sdfg.simplify(validate=False, validate_all=False)
     if DUMP_DIR != Path("."):  # the tool's output directory (not a test's working directory)
         # The specialised SDFG with its short loops still loops: the input for designing which of them become maps.
-        sdfg.save(str(DUMP_DIR / "pre_unroll.sdfgz"), compress=True)
+        dump(sdfg, "pre_unroll")
     keep = heavy_innermost_loop(keep_heavy_loops) if keep_heavy_loops else None
     unrolled = ShortLoopUnroll(UNROLL_LIMIT, keep=keep).apply_pass(sdfg, {})
     if keep is not None:
@@ -608,7 +629,7 @@ def specialize_and_split(sdfg: dace.SDFG, plan: FlattenPlan, symbols: dict, scal
         fold_control_flow_constants(sdfg, {}, {name: list(e) for name, e in arrays.items()})
         sdfg.simplify(validate=False, validate_all=False)
     sdfg.validate()
-    return split_record_companions(sdfg, plan)
+    return split_record_companions(sdfg, plan, own_shapes)
 
 
 def map_heavy_short_loops(sdfg: dace.SDFG, min_tasklets: int, limit: int = UNROLL_LIMIT) -> int:
@@ -672,7 +693,7 @@ def collapse_then_fuse(sdfg: dace.SDFG, map_heavy_loops: int = 0) -> int:
     # become atomic sums, so their loops can map.
     print(f"accumulations made atomic sums: {len(accumulations_to_wcr(sdfg))}", flush=True)
     if DUMP_DIR != Path("."):
-        sdfg.save(str(DUMP_DIR / "pre_parallel.sdfgz"), compress=True)  # debugging aid: the loops LoopToMap sees
+        dump(sdfg, "pre_parallel")  # debugging aid: the loops LoopToMap sees
     sdfg.apply_transformations_repeated(P.LoopToMap)
     sdfg.apply_transformations_repeated(P.StateFusionExtended)
     sdfg.simplify()
@@ -777,6 +798,13 @@ def _scope_nodes_recursive(state: dace.SDFGState, entry: nodes.MapEntry):
                 yield inner
 
 DUMP_DIR = Path(".")  # where the debugging dumps of the pipeline stages go (the output dir)
+DUMP_SDFGS = False  # --dump-sdfgs: save the SDFG after each stage of the pipeline (<name>.sdfgz in DUMP_DIR)
+
+
+def dump(sdfg: dace.SDFG, name: str) -> None:
+    """A debugging dump of a pipeline stage, with --dump-sdfgs (each save of a large SDFG takes a while)."""
+    if DUMP_SDFGS:
+        sdfg.save(str(DUMP_DIR / f"{name}.sdfgz"), compress=True)
 
 
 def kernel_body_states(sdfg: dace.SDFG) -> list[int]:
@@ -809,7 +837,8 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
            scalarise: bool = False, map_heavy_loops: int = 0, heavy_launch: int = 0,
            host_work_limit: int = 0, fuse_small: int = 0, tile_fuse: bool = False, fuse_max_tasklets: int = 0,
            members_first: bool = True, extents: dict | None = None, forward_skip: Iterable[str] = (),
-           plan: FlattenPlan | None = None) -> list[str]:
+           plan: FlattenPlan | None = None, slot_aliases: list = (), present_members: set | frozenset = frozenset(),
+           iteration_scratch: bool = False) -> list[str]:
     """Parallelise ``sdfg`` and turn it into CUDA kernels over device-resident argument arrays.
 
     ``members_first``: the buffers of arrays of records the SDFG takes as arguments (module variables', and with
@@ -828,7 +857,10 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
     drop the copies that only mirror an argument array in a scratch one (fuse_stencils.forward_copies);
     ``elements``: recorded constant elements of arrays (fuse_stencils.fold_control_flow_constants), folded again once
     the loops are unrolled: a loop body that subscripts them with the loop variable does so with constants only
-    then, and the states of a producer and its consumer fuse only once the bounds between them are constants."""
+    then, and the states of a producer and its consumer fuse only once the bounds between them are constants.
+
+    ``iteration_scratch``: the transient arrays kernel bodies only use within one iteration become each body's own
+    (iteration_scratch.localise_iteration_scratch)."""
     t0 = time.time()
     collapses = collapse_then_fuse(sdfg, map_heavy_loops)
     fused_maps = []
@@ -837,7 +869,7 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
 
         if elements:
             before = len(list(sdfg.states()))
-            sdfg.save(str(DUMP_DIR / "pre_fold.sdfgz"), compress=True)  # debugging aid: the SDFG the second folding starts from
+            dump(sdfg, "pre_fold")  # debugging aid: the SDFG the second folding starts from
             sample = [v for e in sdfg.all_interstate_edges(recursive=True) for v in e.data.assignments.values()
                       if any(name in str(v) for name in elements)]
             print(f"assignments reading the recorded arrays before the second folding: {len(sample)}, e.g. {sample[:3]}", flush=True)
@@ -863,8 +895,8 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
         if forward:
             print(f"copy forwarding: {forward_copies(sdfg, known=extents, skip=forward_skip)}", flush=True)
         sdfg.validate()
-        sdfg.save(str(DUMP_DIR / "post_forward.sdfgz"), compress=True)  # debugging aid
-    finish_scratch_images(sdfg, scratch_images or {})
+        dump(sdfg, "post_forward")  # debugging aid
+    finish_scratch_images(sdfg, scratch_images or {}, slot_aliases, present_members)
     laid_out = []
     if members_first:
         from dace_fortran.bindings.record_layout import lay_out_members_first, record_buffers
@@ -879,7 +911,11 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
     from dace_fortran.substitute.collapse_bodies import collapse_through_bodies
 
     print(f"maps collapsed with the map their nested body holds: {collapse_through_bodies(sdfg)}", flush=True)
-    sdfg.save(str(DUMP_DIR / "post_images.sdfgz"), compress=True)  # debugging aid
+    if iteration_scratch:
+        from dace_fortran.substitute.iteration_scratch import localise_iteration_scratch
+
+        print(f"scratch arrays held per kernel iteration: {localise_iteration_scratch(sdfg)}", flush=True)
+    dump(sdfg, "post_images")  # debugging aid
     reordered = order_for_coalescing(sdfg)
     report_sequential_loops(sdfg)
     # The module variables the optimised code no longer reads: the binding need not copy them in on every call.
@@ -925,7 +961,7 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
     # assigned whole, say) runs on the host instead of through device copies made and dropped on every call.
     host = [n for n, d in sdfg.arrays.items() if not d.transient and d.storage != dace.StorageType.GPU_Global]
     host += sorted(n for n in host_arrays if n not in host)  # the transients of the small work kept on the host
-    sdfg.save(str(DUMP_DIR / "pre_gpu.sdfgz"), compress=True)  # debugging aid: the SDFG the GPU transformation starts from
+    dump(sdfg, "pre_gpu")  # debugging aid: the SDFG the GPU transformation starts from
     sdfg.apply_gpu_transformations(host_data=host, host_maps=host_maps)
     # A constant is a host constexpr array: with device storage on either of its descriptors its copies to device
     # buffers would be emitted device-to-device from a host pointer.
@@ -973,7 +1009,7 @@ def to_gpu(sdfg: dace.SDFG, fuse: bool = False, forward: bool = False, elements:
     infer_types.set_default_schedule_and_storage_types(sdfg, None)
     sdfg.expand_library_nodes()
     print(f"host maps made sequential: {host_maps_sequential(sdfg)}", flush=True)
-    sdfg.save(str(DUMP_DIR / "post_gpu.sdfgz"), compress=True)  # debugging aid: what the code generator gets
+    dump(sdfg, "post_gpu")  # debugging aid: what the code generator gets
     refreeze(sdfg)
     sdfg.validate()
     dace.Config.set("compiler", "cuda", "cuda_arch", value=CUDA_ARCH)
@@ -1005,7 +1041,8 @@ LIBRARY_LINK_FLAGS = "-Wl,-Bsymbolic -Wl,--as-needed"
 
 
 def expose_private_imports(
-    bindings: Path, dirs: list[Path], out: Path, extra: dict[str, list[str]] | None = None
+    bindings: Path, dirs: list[Path], out: Path, extra: dict[str, list[str]] | None = None,
+    releases: dict | None = None
 ) -> list[dict]:
     """For every module whose private variables ``bindings`` imports, or ``extra`` names (module -> variables): a copy
     of its source (found in ``dirs``) with accessors to them, the variables, and the ``use`` lines their declarations
@@ -1029,7 +1066,181 @@ def expose_private_imports(
             declared = re.search(rf"::[^!\n]*\b{name}\b", sources[mod], re.IGNORECASE)
             if name and name not in public and declared and name not in wanted.get(mod, []):
                 wanted.setdefault(mod, []).append(name)
-    return write_access_copies(wanted, files, out)
+    return write_access_copies(wanted, files, out, releases)
+
+
+def release_groups(sdfg: dace.SDFG, frozen, released: set[str], values: dict, after: dict[str, tuple[str, str]],
+                   shrink: bool = False):
+    """The released arrays (SDFG names) freed right after the caller's initialisation routines (``after``: the
+    variables' module -> (module, routine) of the initialisation to wrap): per routine, the module copies' release
+    specs (module -> ReleaseSpec list) and the first-call set that stays (arrays of modules without a routine).
+    A plain array is reallocated only when the SDFG holds its extents as literals: a build reading them on every
+    call would read the shrunk ones. A value member of a record (a fixed-size array inside it) has no storage of its
+    own. Returns (per_routine, first_call, shrunk)."""
+    from dace_fortran.bindings.block_builders import _aos_lead, _aos_member_is_static  # noqa: PLC0415
+    from dace_fortran.bindings.module_access import ReleaseSpec  # noqa: PLC0415
+
+    per_routine: dict[tuple[str, str], dict[str, list[ReleaseSpec]]] = {}
+    first_call, shrunk = set(), set()
+    args = {a.sdfg_name: a for a in [*frozen.args, *frozen.shape_only_args]}
+    for name in sorted(released):
+        a = args.get(name)
+        if a is not None and getattr(a, "aos_origin_struct", ""):
+            if _aos_member_is_static(a):
+                continue
+            module = a.aos_origin_mod.lower()
+            root, _, segment = a.aos_origin_struct.partition("%")
+            path = []
+            if segment.strip():
+                path.append((segment.strip(), _aos_lead(a) - a.aos_root_rank, a.aos_struct_pointer))
+            path.append((a.aos_member_path, a.rank - _aos_lead(a), a.aos_member_pointer))
+            spec = ReleaseSpec(root.strip().lower(), tuple(path))  # the binding reads the members' bounds: host stays
+        elif name in frozen.module_symbol_origins:
+            desc = sdfg.arrays.get(name)  # None: fusion removed the array altogether
+            if desc is not None and any(dace.symbolic.issymbolic(x) for x in desc.shape):
+                continue  # an extent read on every call (it differs between ranks or grids): the caller's array stays
+            origin = frozen.module_symbol_origins[name]
+            module, spec = origin.module.lower(), ReleaseSpec(origin.entity.lower(), shrink_allocation=shrink)
+            shrunk.add(name)
+        else:
+            continue
+        if module in after:
+            specs = per_routine.setdefault(after[module], {}).setdefault(module, [])
+            if spec not in specs:
+                specs.append(spec)
+        else:
+            first_call.add(name)
+            shrunk.discard(name)
+    return per_routine, first_call, shrunk
+
+
+def unused_module_arrays(dirs: list[Path], entry: str, outside: list[str], frozen, released: set[str],
+                         after: dict[str, tuple[str, str]], shrink: bool = False) -> dict[str, list]:
+    """Per module (one of ``after``), the allocatable module arrays of the build's sources (``dirs``) that only the
+    call tree of ``entry`` (``module::routine``) reads or writes, which the substitute does not use at all (no
+    argument, no transient, no released image), as ReleaseSpecs: the caller allocates them for the routine the
+    substitute replaced, and nothing else ever touches them. An array of records takes the member path of a released
+    image of the same type; one of a type no image has is left alone. ``outside``: procedures counted outside the
+    routine (stubs, externals)."""
+    from dace_fortran.bindings.block_builders import _aos_lead  # noqa: PLC0415
+    from dace_fortran.bindings.module_access import ReleaseSpec, _module_span, _parse_declaration, _rank, _statements  # noqa: PLC0415
+    from dace_fortran.substitute import outside_refs  # noqa: PLC0415
+    from dace_fortran.substitute.module_copies import module_files  # noqa: PLC0415
+
+    files = module_files(dirs)
+    used: set[tuple[str, str]] = {(o.module.lower(), o.entity.lower()) for o in frozen.module_symbol_origins.values()}
+    paths: dict[str, tuple] = {}  # type spec -> member path, from the released images
+    roots: dict[tuple[str, str], tuple] = {}
+    for a in [*frozen.args, *frozen.shape_only_args]:
+        if getattr(a, "aos_origin_struct", ""):
+            root = a.aos_origin_struct.split("%")[0].strip().lower()
+            used.add((a.aos_origin_mod.lower(), root))
+            if a.sdfg_name in released:
+                segment = a.aos_origin_struct.partition("%")[2].strip()
+                path = ((segment, _aos_lead(a) - a.aos_root_rank, a.aos_struct_pointer),) if segment else ()
+                roots[(a.aos_origin_mod.lower(), root)] = (*path, (a.aos_member_path, a.rank - _aos_lead(a), a.aos_member_pointer))
+    candidates: dict[tuple[str, str], tuple[str, int]] = {}  # (module, name) -> (type spec, rank)
+    for mod in after:
+        if mod not in files:
+            continue
+        lines = files[mod].read_text(errors="replace").splitlines()
+        start, end, contains = _module_span(lines, mod)
+        for statement in _statements(lines[start + 1:contains if contains is not None else end]):
+            parsed = _parse_declaration(statement)
+            if parsed is None:
+                continue
+            type_spec, attributes, entities = parsed
+            if "allocatable" not in attributes or "parameter" in attributes:
+                continue
+            dimension = next((x[len("dimension"):] for x in attributes if x.startswith("dimension")), "")
+            for entity in entities:
+                m = re.match(r"\s*([A-Za-z_]\w*)", entity)
+                if not m:
+                    continue
+                rank = _rank(entity[m.end():].split("=", 1)[0]) or _rank(dimension)
+                key = (mod, m.group(1).lower())
+                if rank and key not in used:
+                    candidates[key] = (type_spec.strip().lower(), rank)
+                if key in roots:
+                    paths.setdefault(type_spec.strip().lower(), roots[key])
+    if not candidates:
+        return {}
+    prog = STARTUP.prog if STARTUP is not None else outside_refs.parse_sources(outside_refs.source_files(dirs))
+    module, routine = (x.lower() for x in entry.split("::"))
+    verdicts = outside_refs.outside_readers(prog, (module, routine), list(candidates), outside)
+    outside_refs.close_alias_groups(verdicts)
+    out: dict[str, list] = {}
+    for key, (type_spec, rank) in sorted(candidates.items()):
+        v = verdicts.get(key)
+        if v is None or v.reasons or v.aliases:
+            continue
+        if type_spec.startswith("type("):
+            if type_spec not in paths:
+                continue
+            out.setdefault(key[0], []).append(ReleaseSpec(key[1], paths[type_spec], shrink_allocation=shrink))
+        else:
+            out.setdefault(key[0], []).append(ReleaseSpec(key[1], shrink_allocation=shrink))
+    return out
+
+
+def keep_written_allocations(prog, entry: str, outside: list[str], per_routine: dict) -> dict:
+    """``per_routine`` (``release_groups``) with ``shrink_allocation`` off for every array that code outside the calls
+    of ``entry`` (``module::routine``) writes, such as an initialisation that zeroes it right after allocating it: a
+    one-element allocation would take those writes out of bounds. Such an array is released after the
+    initialisation instead. ``outside``: procedures counted outside the routine (stubs, externals)."""
+    from dace_fortran.substitute import outside_refs  # noqa: PLC0415
+
+    keys = sorted({(m, s.name) for ms in per_routine.values() for m, specs in ms.items() for s in specs
+                   if s.shrink_allocation})
+    if not keys:
+        return per_routine
+    module, routine = (x.lower() for x in entry.split("::"))
+    verdicts = outside_refs.outside_readers(prog, (module, routine), keys, outside)
+    written = {k for k in keys if verdicts[k].writes}
+    for k in sorted(written):
+        print(f"{k[0]}::{k[1]} keeps its allocation, written outside the replaced routine in {verdicts[k].writes[0]}; "
+              "released after the initialisation instead", flush=True)
+    return {r: {m: [replace(s, shrink_allocation=False) if (m, s.name) in written else s for s in specs]
+                for m, specs in ms.items()} for r, ms in per_routine.items()}
+
+
+def write_release_wrappers(path: Path, per_routine: dict) -> list[dict]:
+    """The Fortran file of the wrappers of the caller's initialisation routines (``release_groups``): each calls the
+    original, then the release procedures of the module copies. Returns the substitute.json "wraps" entries."""
+    from dace_fortran.bindings.module_access import release_name  # noqa: PLC0415
+
+    lines = ["! dace-fortran: the caller's initialisation routines wrapped to free, right after each, the storage of",
+             "! the module arrays the substitute holds itself (--release-scratch, --release-after).", ""]
+    wraps = []
+    for (module, routine), modules in sorted(per_routine.items()):
+        wrapper, original = f"dace_after_{routine}", f"dace_original_{routine}"
+        procs = [release_name(mod, spec.name, spec) for mod, specs in sorted(modules.items()) for spec in specs]
+        lines += [f"subroutine {wrapper}() bind(c, name='{wrapper}_')",
+                  "    use openacc, only: acc_get_property, acc_get_device_type, acc_get_device_num, &",
+                  "        acc_property_memory, acc_property_free_memory, acc_device_kind",
+                  "    use iso_c_binding, only: c_size_t",
+                  "    integer(c_size_t) :: total, free",
+                  "    integer(acc_device_kind) :: dev",
+                  "    interface",
+                  f"        subroutine {original}() bind(c, name='{original}_')",
+                  f"        end subroutine {original}"]
+        for p in procs:
+            lines += [f"        subroutine {p}() bind(c, name='{p}')", f"        end subroutine {p}"]
+        lines += ["    end interface",
+                  f"    call {original}()",
+                  "    dev = acc_get_device_type()",
+                  "    total = acc_get_property(acc_get_device_num(dev), dev, acc_property_memory)",
+                  "    free = acc_get_property(acc_get_device_num(dev), dev, acc_property_free_memory)",
+                  f"    write(0, '(a, f0.2, a)') 'device memory in use after {routine}: ', real(total - free) / 2.0**30, ' GB'"]
+        lines += [f"    call {p}()" for p in procs]
+        lines += ["    free = acc_get_property(acc_get_device_num(dev), dev, acc_property_free_memory)",
+                  f"    write(0, '(a, f0.2, a)') 'device memory in use after the release of {routine}: ', "
+                  "real(total - free) / 2.0**30, ' GB'",
+                  f"end subroutine {wrapper}", ""]
+        wraps.append({"wrap_symbol": f"{module}_{routine}_", "shim_symbol": f"{wrapper}_",
+                      "original_symbol": f"{original}_"})
+    path.write_text("\n".join(lines))
+    return wraps
 
 
 def private_baked_variables(baked: list, dirs: list[Path], records: list[Path]) -> dict[str, list[str]]:
@@ -1096,8 +1307,8 @@ def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scala
     folded: list[tuple[str, int, str, int]] = []  # the member aliases the analysed copy holds as one storage
 
     def specialise(copy: dace.SDFG) -> dict:
-        split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops, arrays, rank_values) \
-            if symbols or scalars else {}
+        split = specialize_and_split(copy, plan, symbols, scalars, args.map_heavy_loops, arrays, rank_values,
+                                     args.split_own_shapes) if symbols or scalars else {}
         if member_aliases:
             folded.extend(fold_member_aliases(copy, member_aliases, recorded))
         # A record image made a transient takes the recorded extents and lower bounds (finish_scratch_images): the
@@ -1108,7 +1319,17 @@ def infer_scratch(sdfg: dace.SDFG, args, plan: FlattenPlan, symbols: dict, scala
                 fold.update(image_symbols(a.sdfg_name, copy.arrays[a.sdfg_name], recorded))
         if fold:
             specialize(copy, symbols=fold)
-        elements = recorded_elements(args.globals, copy) if args.globals else {}
+        # A module scalar the build reads on every call (--symbolic-globals) is a symbol of the SDFG; the analysis
+        # judges the recorded run, so the copy takes its recorded value.
+        module_scalars = {}
+        for key, value in (merged_invariants(args.globals_all) if args.symbolic_globals else {}).items():
+            name = key.split("::", 1)[-1]
+            if "(" not in name and "%" not in name and name in copy.free_symbols and name not in symbols:
+                module_scalars[name] = value
+        if module_scalars:
+            print(f"analysis copy takes the recorded module scalars {module_scalars}", flush=True)
+            specialize(copy, symbols=module_scalars)
+        elements = recorded_elements(args.globals_all, copy) if args.globals_all else {}
         if elements:
             from dace_fortran.substitute.fuse_stencils import fold_control_flow_constants  # noqa: PLC0415
 
@@ -1195,7 +1416,7 @@ def config_path(path, config) -> Path:
 
 
 def main() -> int:
-    global DUMP_DIR, HEAVY_LAUNCH_BOUNDS, CUDA_ARCH, STARTUP
+    global DUMP_DIR, DUMP_SDFGS, HEAVY_LAUNCH_BOUNDS, CUDA_ARCH, STARTUP
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", action="store_true")
     ap.add_argument("--combine-divisions", action="store_true",
@@ -1226,10 +1447,39 @@ def main() -> int:
                     help="straight-line kernel bodies: unroll small maps inside kernels, split small scratch arrays "
                     "into scalars and fuse the bodies' states, before the stencil fusion (straight.py, scalarise.py); "
                     "on by default (same results; fused fifth-order kernels 1.7x faster), --no-scalarise turns it off")
+    ap.add_argument("--split-own-shapes", action="store_true",
+                    help="arrays of records the in-place split leaves packed (several record dimensions, members of "
+                    "different shapes, elements read in control-flow code) go member by member too, each with the "
+                    "extents and lower bounds the binding takes off its member (record_split.py): no buffer spanning "
+                    "the largest member, which for the faces of a domain holds a field per face")
+    ap.add_argument("--iteration-scratch", action="store_true",
+                    help="the scratch arrays every kernel iteration only uses for its own elements (a Riemann "
+                    "solver's face velocities) held in each iteration instead of in a device buffer over the grid "
+                    "(iteration_scratch.py)")
     ap.add_argument("--gpu-streams", type=int, default=1,
                     help="CUDA streams the generated program may use (default 1: every kernel and copy in program "
                          "order on one stream, which the program synchronises before it returns; with more streams, "
                          "work left on the other streams races with what the caller does on the device next)")
+    ap.add_argument("--release-scratch", action="store_true",
+                    help="after the first served call, delete the caller's device copies of the module arrays the "
+                         "substitute holds as its own transients or kept buffers (nothing else reads or writes them); "
+                         "their host arrays stay, so the caller's finalisation is unchanged. Device memory then holds "
+                         "the substitute's buffers instead of both")
+    ap.add_argument("--release-after", action="append", default=[], metavar="[VARMODULE=]MODULE::ROUTINE",
+                    help="with --release-scratch: an initialisation routine of the caller (without arguments) after "
+                         "which the replaced arrays of a module (VARMODULE, the routine's own by default) are freed "
+                         "at once, before later modules allocate theirs: the substitute wraps the routine (repeatable). "
+                         "A plain array is reallocated to one element, a member of an array of records loses its "
+                         "device copy; the extents of reallocated arrays leave the guard")
+    ap.add_argument("--shrink-unused-allocations", action="store_true",
+                    help="with --release-after: the module copies allocate the arrays the substitute never touches "
+                         "(the work arrays fusion removed, the arrays only the replaced routine used) with one element "
+                         "per dimension, by rewriting their allocate statements, so they never take device memory; a "
+                         "statement not found leaves the array to the release after the initialisation")
+    ap.add_argument("--build-jobs", type=int, default=0, metavar="N",
+                    help="cores for DaCe's compile: this many parallel jobs, and a GPU program's kernels over as many "
+                         "CUDA files (one file compiles single-threaded, 17 minutes for 164 kernels; dace's "
+                         "compiler.cuda.split_files); default: dace's own settings")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--record", type=Path, help="file the binding appends the integer symbols of every call to")
     mode.add_argument("--specialize", type=Path, help="symbols recorded with --record to specialise the SDFG to")
@@ -1272,12 +1522,28 @@ def main() -> int:
     ap.add_argument("--keeps-arguments", action="append", default=[], metavar="PROCEDURE",
                     help="with --startup-constants: a procedure the sources do not define (a library's) that changes "
                     "none of its arguments, so a value passed to it stays a start-up constant (repeatable)")
+    ap.add_argument("--runtime", action="append", default=[], metavar="MODULE::VARIABLE",
+                    help="with --startup-constants: a module variable the substitute reads on every call instead of "
+                    "being specialised to its recorded value, though no code changes it after the first call: one "
+                    "that differs from one run to the next, such as the steps a run starts and stops at (repeatable)")
+    ap.add_argument("--symbolic", type=Path, metavar="FILE",
+                    help="with --specialize: recorded names (one per line, # comments) the build leaves symbolic: not "
+                    "baked, not guarded, the binding passes each call's value; the scratch analysis and the alias "
+                    "folds still see every recorded value. For a substitute that serves every grid of a case: the "
+                    "names whose values differ between two grids' records")
+    ap.add_argument("--symbolic-globals", type=Path, metavar="FILE",
+                    help="with --globals: module variables (MODULE::NAME, one per line, # comments; an array of records "
+                    "with all its members) whose recorded values the build does not bake: dropped from the records it "
+                    "specialises to and read on every call; the scratch analysis still sees them. The variables that "
+                    "hold the grid, for a substitute that serves every grid of a case")
     ap.add_argument("--fuse", action="store_true", help="recompute stencil producers inside their consumers (GPU)")
     ap.add_argument("--tile-fuse", action="store_true",
                     help="with --fuse: fuse through a shared-memory tile (the producer once per tile) instead")
     ap.add_argument("--fuse-max-tasklets", type=int, default=0, metavar="N",
                     help="with --fuse: keep a stencil pair apart whose producer and consumer bodies hold more than N "
                          "tasklets together (one heavy kernel runs slower than the two; default 0: no limit)")
+    ap.add_argument("--dump-sdfgs", action="store_true",
+                    help="save the SDFG after each stage of the pipeline (<out>/<stage>.sdfgz), for debugging")
     ap.add_argument("--instrument", action="store_true",
                     help="time every GPU kernel with CUDA events (DaCe GPU_Events instrumentation): the report lands in "
                          "<out>/.dacecache/<sdfg>/perf/ when the program exits; summarise with rhs/perf_report.py")
@@ -1300,8 +1566,29 @@ def main() -> int:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     DUMP_DIR = out
+    DUMP_SDFGS = args.dump_sdfgs
     HEAVY_LAUNCH_BOUNDS = args.heavy_launch_bounds
     CUDA_ARCH = args.cuda_arch
+    args.globals_all = list(args.globals)  # every recorded module value: the scratch analysis judges the recorded grid
+    if args.symbolic_globals:
+        keys = [line.split()[0].lower() for line in args.symbolic_globals.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+
+        def not_baked(line: str) -> bool:
+            key = line.split(" ", 1)[0].lower()
+            return any(key == k or key.startswith(k + "(") or key.startswith(k + "%") for k in keys)
+
+        filtered = []
+        for i, record in enumerate(args.globals):
+            folder = out / f"globals{i}"
+            folder.mkdir(parents=True, exist_ok=True)
+            for side in record.parent.glob("*.json"):
+                shutil.copy(side, folder / side.name)
+            kept = [line for line in record.read_text().splitlines(keepends=True) if not not_baked(line)]
+            (folder / record.name).write_text("".join(kept))
+            filtered.append(folder / record.name)
+        print(f"module variables read on every call instead of baked: {keys}", flush=True)
+        args.globals = filtered
     if args.startup_constants:
         if not args.fypp:
             raise SystemExit("--startup-constants needs the build's sources (--fypp)")
@@ -1309,7 +1596,8 @@ def main() -> int:
         from dace_fortran.substitute.startup_constants import StartupAnalysis  # noqa: PLC0415
 
         STARTUP = StartupAnalysis(parse_sources(source_files(args.fypp)), tuple(args.entry.lower().split("::")),
-                                  keeps_arguments=frozenset(n.lower() for n in args.keeps_arguments))
+                                  keeps_arguments=frozenset(n.lower() for n in args.keeps_arguments),
+                                  runtime=frozenset(tuple(n.lower().split("::", 1)) for n in args.runtime))
         start = f"main program {STARTUP.main.name}" if STARTUP.main else "no single main program"
         print(f"start-up: {start}; {len(STARTUP.after_procedures)} procedures may run after the first call",
               flush=True)
@@ -1331,6 +1619,12 @@ def main() -> int:
     recorded = recorded_invariants(args.specialize) if args.specialize else {}
     if STARTUP is not None and recorded:
         recorded = keep_startup_symbols(recorded, general, iface, plan)
+    symbolic: set[str] = set()
+    if args.symbolic:
+        symbolic = {line.split()[0] for line in args.symbolic.read_text().splitlines()
+                    if line.strip() and not line.startswith("#")}
+    recorded_all = recorded  # every recorded value: the scratch analysis judges the SDFG as built for the recorded grid
+    recorded = {name: value for name, value in recorded.items() if name not in symbolic}
     values = {}
     if args.specialize:
         guardable = specializable(general, iface, plan)
@@ -1338,24 +1632,35 @@ def main() -> int:
     symbols = {name: value for name, value in values.items() if name in general.free_symbols}
     scalars = {name: value for name, value in values.items() if name not in symbols}
     arrays = recorded_arrays(recorded, general, iface, plan) if args.specialize else {}
+    values_all = {name: value for name, value in sorted(recorded_all.items()) if name in guardable} \
+        if args.specialize else {}
+    symbols_all = {name: value for name, value in values_all.items() if name in general.free_symbols}
+    scalars_all = {name: value for name, value in values_all.items() if name not in symbols_all}
+    arrays_all = recorded_arrays(recorded_all, general, iface, plan) if args.specialize else {}
+    if symbolic:
+        print(f"left symbolic, passed on every call: {sorted(n for n in symbolic if n in recorded_all)}", flush=True)
     if arrays:
         print(f"specialised to the elements of small module arrays: {arrays}", flush=True)
     # The recorded values that differ between the ranks of a run: known sets, not baked (the names the guard could
     # check, like the baked ones).
-    value_sets = {name: v for name, v in recorded_value_sets(args.specialize).items()
-                  if name in specializable(general, iface, plan)} if args.specialize else {}
+    value_sets_all = {name: v for name, v in recorded_value_sets(args.specialize).items()
+                      if name in specializable(general, iface, plan)} if args.specialize else {}
+    value_sets = {name: v for name, v in value_sets_all.items() if name not in symbolic}
     # Each rank's combination of them: the binding admits these only, so the build may rely on them.
     rank_values = [{n: r[n] for n in value_sets} for r in recorded_rank_values(args.specialize)] if value_sets else []
+    rank_values_all = [{n: r[n] for n in value_sets_all} for r in recorded_rank_values(args.specialize)] \
+        if value_sets_all else []
     if value_sets:
         print(f"values that differ between the ranks, kept with their sets: {value_sets}", flush=True)
     # The in-call analysis also decides over each rank's elements of the module arrays of records that differ between
     # the ranks (grid bounds on unequal shares), which recorded_elements does not fold.
-    rank_elements = recorded_rank_elements(args.globals, sdfg) if rank_values and args.globals else []
-    analysis_cases = [{**case, **mine} for case, mine in zip(rank_values, rank_elements, strict=True)] \
-        if any(rank_elements) else rank_values
+    rank_elements = recorded_rank_elements(args.globals_all, sdfg) if rank_values_all and args.globals_all else []
+    analysis_cases = [{**case, **mine} for case, mine in zip(rank_values_all, rank_elements, strict=True)] \
+        if any(rank_elements) else rank_values_all
     scratch_names = list(args.scratch)
     if args.auto_scratch:
-        scratch_names += infer_scratch(sdfg, args, plan, symbols, scalars, args.stub, recorded, arrays, analysis_cases)
+        scratch_names += infer_scratch(sdfg, args, plan, symbols_all, scalars_all, args.stub, recorded_all, arrays_all,
+                                       analysis_cases)
     scratch, scratch_images = [], {}
     if scratch_names:
         scratch, scratch_images = make_scratch_transient(sdfg, scratch_names, recorded)
@@ -1375,7 +1680,8 @@ def main() -> int:
         print(f"specialised to {len(values)} of {len(recorded)} invariant values: "
               f"{values}", flush=True)
     if values:
-        split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops, arrays, rank_values)
+        split = specialize_and_split(sdfg, plan, symbols, scalars, args.map_heavy_loops, arrays, rank_values,
+                                     args.split_own_shapes)
         print(f"arrays of records handed over per element: {split}", flush=True)
     if args.specialize:
         # A member of an element of a module array of records that IS another array of the SDFG (the sizing run's
@@ -1406,6 +1712,12 @@ def main() -> int:
             sdfg.simplify(validate=False, validate_all=False)
             print(f"recorded elements of module arrays of records folded: {elements}", flush=True)
     members_first = []
+    slot_aliases, present_members = [], set()
+    if args.specialize:
+        from dace_fortran.bindings.specialization import recorded_present_members  # noqa: PLC0415
+
+        slot_aliases = [a for a in startup_member_aliases(args.specialize, general) if a[0] == a[2]]
+        present_members = recorded_present_members(args.specialize)
     if args.gpu:
         members_first = to_gpu(sdfg, fuse=args.fuse, forward=args.forward, elements=elements,
                                scratch_images=scratch_images, combine_divisions=args.combine_divisions,
@@ -1414,18 +1726,23 @@ def main() -> int:
                                fuse_small=args.fuse_small_maps, tile_fuse=args.tile_fuse,
                                fuse_max_tasklets=args.fuse_max_tasklets,
                                members_first=not args.records_first,
-                               extents=recorded, forward_skip=args.forward_skip, plan=plan)
+                               extents=recorded, forward_skip=args.forward_skip, plan=plan,
+                               slot_aliases=slot_aliases, present_members=present_members,
+                               iteration_scratch=args.iteration_scratch)
     elif values:
         refreeze(sdfg)
     if args.record_only and not args.gpu:
         # A sizing run never executes the SDFG: sequential maps keep OpenMP (GCC's runtime, which clashes with the
-        # NVHPC runtime of a GPU build of MFC) out of the library. Library nodes expand into maps of their own, so
+        # NVHPC runtime of a GPU build of the caller) out of the library. Library nodes expand into maps of their own, so
         # expand them first.
         sdfg.expand_library_nodes()
         for node, _parent in sdfg.all_nodes_recursive():
             if isinstance(node, nodes.MapEntry):
                 node.map.schedule = dace.ScheduleType.Sequential
     dace.Config.set("compiler", "linker", "args", value=LIBRARY_LINK_FLAGS)
+    if args.build_jobs:
+        dace.Config.set("compiler", "build_jobs", value=args.build_jobs)
+        dace.Config.set("compiler", "cuda", "split_files", value=args.build_jobs)
     if args.gpu:
         dace.Config.set("compiler", "cuda", "max_concurrent_streams", value=args.gpu_streams)
     if not args.fma:
@@ -1446,6 +1763,44 @@ def main() -> int:
     bindings = out / f"{name}_bindings.f90"
     acc = plan_device_resident_caller(sdfg, frozen, iface, plan) if args.gpu else None
     kept_images = kept_buffers(frozen, keep_keys)
+    # A recording stand-in never serves a call: nothing to release. Of the plain module arrays, the deferred-shape
+    # ones (the size record holds their extents): a fixed-size array has no allocated() test and little memory.
+    released = set()
+    if args.release_scratch and not args.record:
+        released = {n for n in scratch if f"{n}_d0" in recorded_all} | set(scratch_images) | set(kept_images)
+    after: dict[str, tuple[str, str]] = {}
+    for item in args.release_after if not args.record else ():  # a recording stand-in leaves the caller's arrays alone
+        var_module, _, where = item.rpartition("=")
+        mod, routine_name = where.split("::")
+        after[(var_module or mod).lower()] = (mod.lower(), routine_name.lower())
+    per_routine, released, shrunk = release_groups(sdfg, frozen, released, values, after,
+                                                   args.shrink_unused_allocations)
+    if after and args.fypp:
+        unused = unused_module_arrays([d.resolve() for d in args.fypp], args.entry, args.stub, frozen,
+                                      set(scratch) | set(scratch_images) | set(kept_images), after,
+                                      args.shrink_unused_allocations)
+        for mod, specs in unused.items():
+            per_routine.setdefault(after[mod], {}).setdefault(mod, []).extend(specs)
+        if unused:
+            print(f"module arrays only the replaced routine used, released at the caller's initialisation too: "
+                  f"{ {m: [x.name for x in sp] for m, sp in unused.items()} }", flush=True)
+    if args.shrink_unused_allocations and args.fypp and per_routine:
+        from dace_fortran.substitute import outside_refs  # noqa: PLC0415
+        prog = STARTUP.prog if STARTUP is not None else \
+            outside_refs.parse_sources(outside_refs.source_files([d.resolve() for d in args.fypp]))
+        per_routine = keep_written_allocations(prog, args.entry, args.stub, per_routine)
+    if per_routine:
+        print(f"released right after the caller's initialisation: "
+              f"{ {r: {m: [s.name for s in sp] for m, sp in ms.items()} for r, ms in per_routine.items()} }", flush=True)
+    if released:
+        print(f"the caller's device copies released before the first call: {sorted(released)}", flush=True)
+    # The extents of arrays reallocated at initialisation are not what the SDFG was specialised to any more.
+    guard_values = {k: v for k, v in values.items()
+                    if not any(re.fullmatch(rf"(offset_|lb_|cap_)?{re.escape(n)}_d\d+", k) for n in shrunk)}
+    rank_values = [{k: v for k, v in r.items() if not any(re.fullmatch(rf"(offset_|lb_|cap_)?{re.escape(n)}_d\d+", k)
+                                                        for n in shrunk)} for r in rank_values]
+    if shrunk:
+        print(f"extents out of the guard (arrays reallocated at initialisation): {sorted(set(values) - set(guard_values))}", flush=True)
     # The caller's modules are used as they are (no TARGET patched in): copy allocatable module arrays, do not alias
     # them.
     emit = functools.partial(
@@ -1458,7 +1813,7 @@ def main() -> int:
         init_symbols=compiled_init_symbols(sdfg_so, sdfg.name),
         module_allocatables_are_targets=False,
         acc_residency=acc,
-        specialization=Specialization(values, general, arrays, tuple(rank_values)),
+        specialization=Specialization(guard_values, general, arrays, tuple(rank_values)),
         record_symbols_to=args.record.resolve() if args.record else None,
         record_only=args.record_only,
         record_per_rank=args.record_per_rank,
@@ -1467,6 +1822,7 @@ def main() -> int:
         members_first=members_first,
         prologue=tuple(args.binding_prologue),
         prologue_uses=tuple(args.binding_use),
+        released=released,
     )
     try:
         emit()
@@ -1489,8 +1845,11 @@ def main() -> int:
     # copies the binding uses.
     private_baked = private_baked_variables(baked, dirs, args.globals)
     access = []
+    releases = {mod: specs for ms in per_routine.values() for mod, specs in ms.items()}
+    if per_routine and not dirs:
+        raise SystemExit("--release-after needs --fypp (the build's sources): the release procedures go into the module copies")
     if dirs:
-        access = expose_private_imports(bindings, dirs, out / "access", extra=private_baked)
+        access = expose_private_imports(bindings, dirs, out / "access", extra=private_baked, releases=releases)
         if access:
             emit(
                 private_access={a["module"]: a["variables"] for a in access},
@@ -1512,11 +1871,21 @@ def main() -> int:
             private_access={a["module"]: a["variables"] for a in access},
             private_imports=list(dict.fromkeys(line for a in access for line in a["imports"])),
             refuse_handover=bool(kept_images),
+            refuse_always=bool(per_routine),
             known=known,
         )
         if private_baked:
             print(f"substitute entry checks baked private variables through accessors: {private_baked}", flush=True)
+    if per_routine and access:
+        shrunk_specs = {(a["module"], spec.name, spec.path) for a in access for spec in a.get("shrunk", [])}
+        per_routine = {r: {m: [sp for sp in specs if (m, sp.name, sp.path) not in shrunk_specs] for m, specs in ms.items()}
+                       for r, ms in per_routine.items()}
+        per_routine = {r: {m: specs for m, specs in ms.items() if specs} for r, ms in per_routine.items()}
+        per_routine = {r: ms for r, ms in per_routine.items() if ms}
+    wraps = write_release_wrappers(out / "release_after.f90", per_routine) if per_routine else []
     info = {
+        "wraps": wraps,
+        "sources": [str(out / "release_after.f90")] if per_routine else [],
         "sdfg_so": str(sdfg_so),
         "bindings": str(bindings),
         "sdfg_name": sdfg.name,

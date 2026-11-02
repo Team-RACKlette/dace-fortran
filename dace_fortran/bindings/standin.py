@@ -313,6 +313,7 @@ def emit_substitute_entry(
     private_imports: Sequence[str] = (),
     refuse_handover: bool = False,
     known: Mapping[str, str] | None = None,
+    refuse_always: bool = False,
 ) -> Path:
     """Write ``dace_sub_<entry>``: calls the binding's ``wrapper`` and, when it declines the call (``dace_declined``),
     the original instead.
@@ -325,7 +326,8 @@ def emit_substitute_entry(
     do not follow: once the binding has taken a call, a call it would leave to the original stops the program instead
     (the original would compute on members the kept buffers have moved past). ``known``: the module of other
     variables by name, for an extent of a dummy that neither the routine's imports nor ``baked`` name
-    (:func:`render_dummies`)."""
+    (:func:`render_dummies`). ``refuse_always``: the caller's arrays the substitute replaced were released at the
+    caller's initialisation (``--release-after``), so no call can go to the original: a declined call stops."""
     args = [a.name for a in iface.args]
     original = standin_name("original", iface.entry)
     uses = [f"use {binding_module}, only: {wrapper}"]
@@ -340,6 +342,12 @@ def emit_substitute_entry(
         "    error stop",
         "end if",
     ] if refuse_handover else []
+    if refuse_always:
+        refuse = [
+            f"write(0, '(3a)') '{iface.entry}: the substitute declines (', trim(dace_why), '); the arrays it replaced &",
+            "    &were released at the caller''s initialisation, so the original cannot run: stopping'",
+            "error stop",
+        ]
     # The first call declined says why, once: a baked variable (the entry's own checks) or the binding's checks.
     report = [
         "if (declined .and. .not. dace_reported) then",
@@ -366,10 +374,11 @@ def emit_substitute_entry(
     ]
     if refuse_handover:
         body += ["if (declined) then", *(f"    {ln}" for ln in refuse), "else", "    dace_took = .true.", "end if"]
-    body += [
-        *report,
-        *_with_arguments(f"if (declined) call {original}", args),
-    ]
+    body += report
+    if refuse_always:
+        body += ["if (declined) then", *(f"    {ln}" for ln in refuse), "end if"]
+    else:
+        body += _with_arguments(f"if (declined) call {original}", args)
     lines = _subroutine(standin_name("sub", iface.entry), iface, body, uses, local,
                         known={**(known or {}), **{_variable(v.name).lower(): v.module for v, _ in baked}})
     out = Path(out_path)

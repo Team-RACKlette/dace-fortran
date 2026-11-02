@@ -356,3 +356,64 @@ def fold_member_aliases(sdfg: dace.SDFG, aliases: list[tuple[str, int, str, int]
         elif _fold_one(sdfg, b, backward, known):
             folded += [(b, e, o, oe) for e, (o, oe) in sorted(backward.items())]
     return folded
+
+
+def fold_record_slots(sdfg: dace.SDFG, images: dict[str, int], aliases: list[tuple[str, int, str, int]],
+                      present: set[tuple[str, int]]) -> dict[str, int]:
+    """Fold the leading dimension of each transient image in ``images`` (a module array of records under a root array,
+    ``flux(d)%vf(l)%sf``, as ``[root, segment, field dims...]`` with literal leading extents) whose root elements the
+    program associates with the first: the sizing run recorded (``aliases``, its ``same`` lines) every member
+    ``present`` in root element ``d`` as the storage of the same member of root element 0. Every access of slot ``d``
+    becomes one of slot 0, in the nested SDFGs too, and the dimension shrinks to one: the image holds what the
+    program's storage holds. ``images``: image -> its record dimensions (only one with two, root and segment, has
+    slots to fold). Returns, per image folded, the number of slots it had."""
+    folded = {}
+    for image, record_dims in images.items():
+        desc = sdfg.arrays.get(image)
+        if record_dims != 2 or desc is None or len(desc.shape) < 2 \
+                or any(symbolic.issymbolic(x) for x in desc.shape[:2]):
+            continue
+        slots, members = int(desc.shape[0]), int(desc.shape[1])
+        same = {(e, oe) for i, e, o, oe in aliases if i == o == image}
+        if slots < 2 or not same or not any(i == image for i, _e in present):
+            continue
+        if not all((d * members + l, l) in same or (l, d * members + l) in same
+                   for d in range(1, slots) for l in range(members) if (image, d * members + l) in present):
+            continue
+        for edge in sdfg.all_interstate_edges():
+            if any(m.data == image for m in edge.data.get_read_memlets(sdfg.arrays)):
+                raise ValueError(f"{image}: an interstate edge reads it, so its slots cannot fold")
+        _fold_slots(sdfg, image)
+        folded[image] = slots
+    return folded
+
+
+def _fold_slots(container: dace.SDFG, array: str) -> None:
+    """Every memlet of ``array`` in ``container`` at slot 0 (its leading index a literal), the arrays nested SDFGs
+    take it as alike, and the leading extent one."""
+    desc = container.arrays[array]
+    for state in container.all_states():
+        for edge in state.edges():
+            memlet = edge.data
+            if memlet.is_empty():
+                continue
+            if memlet.data == array:
+                _first_slot(memlet.subset, array)
+            elif memlet.other_subset is not None and any(
+                    isinstance(n, nodes.AccessNode) and n.data == array for n in (edge.src, edge.dst)):
+                _first_slot(memlet.other_subset, array)
+        for node in state.nodes():
+            if isinstance(node, nodes.NestedSDFG):
+                for edge in [*state.in_edges(node), *state.out_edges(node)]:
+                    conn = edge.dst_conn if edge.dst is node else edge.src_conn
+                    if edge.data.data == array and conn and conn in node.sdfg.arrays \
+                            and len(node.sdfg.arrays[conn].shape) == len(desc.shape):
+                        _fold_slots(node.sdfg, conn)
+    desc.set_shape((1, *desc.shape[1:]))
+
+
+def _first_slot(subset: subsets.Range, array: str) -> None:
+    lo, hi, step = subset.ranges[0]
+    if symbolic.issymbolic(lo) or symbolic.issymbolic(hi) or int(lo) != int(hi):
+        raise ValueError(f"{array}: an access does not pick one slot by a literal ({subset})")
+    subset.ranges[0] = (0, 0, step)

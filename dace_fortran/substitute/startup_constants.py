@@ -127,11 +127,15 @@ def _namelist_groups(prog: Program) -> dict[str, set[str]]:
 class StartupAnalysis:
     """Where code that may run after the first call of ``routine`` (module, procedure) may change module variables."""
 
-    def __init__(self, prog: Program, routine: Key, keeps_arguments: frozenset[str] = frozenset()):
+    def __init__(self, prog: Program, routine: Key, keeps_arguments: frozenset[str] = frozenset(),
+                 runtime: frozenset[Key] = frozenset()):
         """``keeps_arguments``: procedures the sources do not define (a library's) that change none of their
-        arguments, lower-case; a call of one leaves the variables passed to it as they were."""
+        arguments, lower-case; a call of one leaves the variables passed to it as they were. ``runtime``: module
+        variables (module, name), lower-case, that count as changed although no code changes them after the first
+        call: values that differ from one run to the next, such as the steps a run starts and stops at."""
         self.prog = prog
         self.keeps_arguments = keeps_arguments
+        self.runtime = runtime
         self.by_name: dict[str, list[Scope]] = defaultdict(list)
         for p in prog.procedures:
             self.by_name[p.name].append(p)
@@ -212,6 +216,8 @@ class StartupAnalysis:
         """Where code that may run after the routine's first call may change the module variable ``key`` (module,
         name) -- its shape only, with ``shape`` -- empty when what it has at that call holds for the rest of the run."""
         key = (key[0].lower(), key[1].lower())
+        if key in self.runtime and not shape:
+            return ["read on every call (runtime)"]
         if (key, shape) not in self._cache:
             self._cache[(key, shape)] = self._find_changes(key, shape)
         return self._cache[(key, shape)]

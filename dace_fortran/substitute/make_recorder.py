@@ -1,21 +1,21 @@
-"""Generate the recording stand-in of an MFC routine from its HLFIR.
+"""Generate the recording stand-in of a routine from its HLFIR.
 
-Linked in the routine's place (link_substitute.sh, record_substitutes.sbatch) for one run of a case, the stand-in
-appends the values of the configuration variables the routine reads -- the specialisation candidates dace-fortran
-reports -- to a record on every call and then runs the routine itself. The record holds the values a specialised
-substitute is built for, exactly as the run has them (derived ones like grid_geometry included).
+Linked in the routine's place for one run of a case, the stand-in appends the values of the configuration variables
+the routine reads -- the specialisation candidates dace-fortran reports -- to a record on every call and then runs the
+routine itself. The record holds the values a specialised substitute is built for, exactly as the run has them
+(derived ones included).
 
 A public module variable is read through its module; a private one through the accessor of a copy of its module
-(module_copies.py), which link_substitute.sh compiles and links in place of the module's object (the "access" entries of
+(module_copies.py), which the build compiles and links in place of the module's object (the "access" entries of
 substitute.json). Candidates whose module source is not found, or whose variable cannot be made accessible, are listed
 as not recordable.
 
 Usage: make_recorder.py [--fypp <dir> ...] <file.hlfir> <module::procedure> <fypp dir> <out dir> [<record>]
   <record>: a record of an earlier recorder of the same entry: its values prune the code first, so variables passed on
   only in branches this configuration never runs become recordable too.
-  <fypp dir>: the build's preprocessed sources (build/staging/<slug>/fypp/simulation), searched for the modules.
+  <fypp dir>: the build's preprocessed sources, searched for the modules.
   --fypp <dir>: more directories of the build's sources, searched after <fypp dir> (repeatable): the modules that
-  provide the kinds and types of private variables (src/common's m_precision_select, say).
+  provide the kinds and types of private variables (a module selecting the working precision, say).
 """
 
 from __future__ import annotations

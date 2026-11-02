@@ -5,9 +5,9 @@ import dace
 import networkx as nx
 import numpy as np
 from dace.properties import CodeBlock
-from dace.sdfg.state import ConditionalBlock, ControlFlowRegion
+from dace.sdfg.state import ConditionalBlock, ControlFlowRegion, LoopRegion
 
-from dace_fortran.array_split import constant_indices, split_array
+from dace_fortran.array_split import constant_indices, rebase, split_array
 
 
 def _rows_sdfg(index_of_second: str = "2") -> dace.SDFG:
@@ -148,3 +148,70 @@ def test_ordering_edges_of_a_node_hold_for_every_part():
         assert any(e.dst is out and e.data.is_empty() for e in state.out_edges(part))
     assert any(e.src is x and e.dst is out and e.data.is_empty() for e in state.edges())
     assert nx.is_directed_acyclic_graph(state.nx)
+
+
+def _bare(code: str) -> str:
+    """Code without spaces and parentheses (how DaCe prints a condition back varies)."""
+    return code.replace(" ", "").replace("(", "").replace(")", "")
+
+
+def _faces_sdfg() -> dace.SDFG:
+    """Two faces of an array of records packed as ``f[2, 4]`` (counted from the lower bound ``lo`` the elements
+    share), read only in control flow: ``out[i] = 1`` where face 0 holds a 7 at ``i``, then ``s = f[1, 2 - lo]``."""
+    sdfg = dace.SDFG("faces")
+    sdfg.add_symbol("lo", dace.int64)
+    sdfg.add_array("f", [2, 4], dace.int32)
+    sdfg.add_array("out", [4], dace.float64)
+    sdfg.add_symbol("s", dace.int64)
+    loop = LoopRegion("over_i", "i < 4", "i", "i = 0", "i = i + 1")
+    sdfg.add_node(loop, is_start_block=True)
+    branch = ConditionalBlock("if_seven")
+    loop.add_node(branch, is_start_block=True)
+    body = ControlFlowRegion("then", sdfg=sdfg)
+    mark = body.add_state("mark", is_start_block=True)
+    t = mark.add_tasklet("one", {}, {"o"}, "o = 1")
+    mark.add_edge(t, "o", mark.add_write("out"), None, dace.Memlet("out[i]"))
+    branch.add_branch(CodeBlock("f[0, i - lo] == 7"), body)
+    after = sdfg.add_state("after")
+    sdfg.add_edge(loop, after, dace.InterstateEdge(assignments={"s": "f[1, 2 - lo]"}))
+    return sdfg
+
+
+def test_reads_in_control_flow_split_with_code_and_are_rewritten():
+    sdfg = _faces_sdfg()
+    assert split_array(sdfg, "f") is None  # without code: control flow reads the array
+    assert constant_indices(sdfg, "f", code=True) == {0, 1}
+    assert split_array(sdfg, "f", code=True) == {0: "f_0", 1: "f_1"}
+    branch = next(b for b in sdfg.all_control_flow_blocks() if isinstance(b, ConditionalBlock))
+    assert _bare(branch.branches[0][0].as_string) == "f_0[i-lo]==7"
+    (edge,) = [e for e in sdfg.all_interstate_edges() if e.data.assignments]
+    assert _bare(edge.data.assignments["s"]) == "f_1[2-lo]"
+    assert tuple(sdfg.arrays["f_0"].shape) == (4,)
+
+
+def test_the_whole_array_named_in_code_leaves_it():
+    sdfg = _faces_sdfg()
+    (edge,) = [e for e in sdfg.all_interstate_edges() if e.data.assignments]
+    edge.data.assignments["s"] = "len(f)"
+    assert constant_indices(sdfg, "f", code=True) is None
+    assert split_array(sdfg, "f", code=True) is None
+    assert "f" in sdfg.arrays
+
+
+def test_rebase_gives_an_element_its_own_extent_and_origin(tmp_path):
+    """Face 0 split off, then counted from its own lower bound ``lo0`` instead of the shared ``lo``: what reads
+    f_0[i - lo] reads f_0[i - lo0], and the array holds ``n0`` values."""
+    sdfg = _faces_sdfg()
+    split_array(sdfg, "f", code=True)
+    sdfg.add_symbol("lo0", dace.int64)
+    sdfg.add_symbol("n0", dace.int64)
+    rebase(sdfg, "f_0", ["n0"], ["lo - lo0"])
+    assert [str(s) for s in sdfg.arrays["f_0"].shape] == ["n0"]
+    branch = next(b for b in sdfg.all_control_flow_blocks() if isinstance(b, ConditionalBlock))
+    assert _bare(branch.branches[0][0].as_string) == "f_0[i-lo0]==7"
+    sdfg.build_folder = str(tmp_path / "build")
+    face0 = np.array([0, 0, 7, 0, 7], dtype=np.int32)  # its own lower bound -1: index i sits at i + 1
+    face1 = np.zeros(4, dtype=np.int32)
+    out = np.zeros(4)
+    sdfg(f_0=face0, f_1=face1, out=out, lo=0, lo0=-1, n0=5)
+    np.testing.assert_array_equal(out, [0, 1, 0, 1])

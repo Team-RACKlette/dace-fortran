@@ -61,6 +61,7 @@ def emit_bindings(
     members_first: Collection[str] = (),
     prologue: Sequence[str] = (),
     prologue_uses: Sequence[str] = (),
+    released: Collection[str] = (),
 ) -> Path:
     """Emit a Fortran binding module for the built SDFG.
 
@@ -119,6 +120,9 @@ def emit_bindings(
     guards, before it hands anything to the SDFG), in the scope of the routine's dummies -- e.g. a call the routine
     starts with, dropped from the SDFG (``stub``) and made here in Fortran on the caller's own data;
     ``prologue_uses``: the ``use`` lines they need (``module, only: names``).
+    ``released``: SDFG names of module arrays (and images of module arrays of records) the substitute holds as
+    its own transients or kept buffers: after the first served call the wrapper deletes the caller's device copies
+    of them (:func:`block_builders.build_release`); the host arrays stay.
     ``kept_images``: arguments of the SDFG that are buffers of module arrays of records only the routine uses (nothing
     else reads or writes their members between its calls): the wrapper packs such a buffer once, keeps it (and its
     device copy) for the next call and never copies it back, so the routine's state lives in the buffer instead of the
@@ -186,6 +190,7 @@ def emit_bindings(
             acc_residency=acc_residency,
             kept=kept,
             members_first=first,
+            released=frozenset(released),
         ),
         "finalize": build_finalize(iface),
     }
@@ -208,7 +213,7 @@ def emit_bindings(
         if record_only:
             # The members of elements of module arrays of records that are another array of the SDFG: the substitute
             # built from the record folds the two (its storage guard would decline them).
-            aliases = build_alias_record(frozen, iface, plan, record_symbols_to)
+            aliases = build_alias_record(frozen, iface, plan, record_symbols_to, per_rank=record_per_rank)
             if aliases:
                 record = [*aliases, "", *record]
                 blocks["helpers"] = STORAGE_GUARD_HELPERS

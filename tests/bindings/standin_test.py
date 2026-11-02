@@ -285,7 +285,7 @@ class _PrivateProgram:
         )
         copy_dir = tmp_path / "copy"
         copy_dir.mkdir()
-        source, self.exposed = expose_module_variables(_OPTS, "opts", _PRIVATE)
+        source, self.exposed, _ = expose_module_variables(_OPTS, "opts", _PRIVATE)
         (copy_dir / "opts.f90").write_text(source)
         self.copy = _compile(copy_dir / "opts.f90", copy_dir, tmp_path)
         self.imports = declaration_imports(
@@ -367,7 +367,7 @@ def test_baked_private_values_are_checked_through_the_accessors_of_a_copy(tmp_pa
 
 def test_a_private_allocatable_is_refused(tmp_path: Path):
     iface = _interface(tmp_path)
-    _, exposed = expose_module_variables(_OPTS, "opts", ["flags"])
+    _, exposed, _ = expose_module_variables(_OPTS, "opts", ["flags"])
     allocatable = {"opts": {"flags": replace(exposed["flags"], allocatable=True)}}
     with pytest.raises(UnsupportedStandinError, match="allocatable"):
         emit_recording_standin(iface, _OPTS_VALUES[1:2], tmp_path / "r", tmp_path / "s.f90", allocatable)

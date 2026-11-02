@@ -25,10 +25,13 @@ def module_files(dirs: Iterable[Path]) -> dict[str, Path]:
 
 
 def write_access_copies(
-    wanted: Mapping[str, Sequence[str]], files: Mapping[str, Path], out: Path
+    wanted: Mapping[str, Sequence[str]], files: Mapping[str, Path], out: Path,
+    releases: Mapping[str, Sequence] | None = None
 ) -> list[dict]:
-    """For each module of ``wanted``: a copy of its source (from ``files``) in ``out`` with accessors to the variables
-    ``wanted`` names, the variables (``ExposedVariable`` by name) and the ``use`` lines their declarations need.
+    """For each module of ``wanted`` (and of ``releases``): a copy of its source (from ``files``) in ``out`` with
+    accessors to the variables ``wanted`` names and release procedures for ``releases`` (module ->
+    ``module_access.ReleaseSpec``), the variables (``ExposedVariable`` by name) and the ``use`` lines their
+    declarations need.
 
     :raises dace_fortran.bindings.module_access.ModuleAccessError: a variable cannot be made accessible.
     """
@@ -37,9 +40,10 @@ def write_access_copies(
     sources = {mod: path.read_text(errors="replace") for mod, path in files.items()}
     out.mkdir(parents=True, exist_ok=True)
     access = []
+    wanted = {**{mod: [] for mod in (releases or {})}, **wanted}
     for mod, names in sorted(wanted.items()):
         names = list(dict.fromkeys(n.lower() for n in names))
-        copy_text, variables = expose_module_variables(sources[mod], mod, names)
+        copy_text, variables, shrunk = expose_module_variables(sources[mod], mod, names, (releases or {}).get(mod, ()))
         copy = out / files[mod].name
         copy.write_text(copy_text)
         access.append({
@@ -48,8 +52,11 @@ def write_access_copies(
             "copy": str(copy),
             "variables": variables,
             "imports": declaration_imports(list(variables.values()), mod, sources),
+            "shrunk": shrunk,
         })
-        print(f"accessors for {mod}: {' '.join(names)}", flush=True)
+        print(f"accessors for {mod}: {' '.join(names)}"
+              + (f"; release procedures: {' '.join(r.name for r in releases[mod])}" if releases and mod in releases else ""),
+              flush=True)
     return access
 
 

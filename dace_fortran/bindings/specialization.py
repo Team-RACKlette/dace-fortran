@@ -193,48 +193,54 @@ def _parse(text: str) -> Value:
         return float(text.replace("D", "E"))
 
 
-def recorded_aliases(path: str | Path) -> list[tuple[str, int, str]]:
-    """The ``(image, element, array)`` aliases every call recorded at ``path`` reported (``<path>.aliases``, written
-    by the alias record of a sizing run: the member of ``element`` of the array of records ``image`` is the SDFG image
-    of IS the array ``array``); empty without the file."""
+def _alias_calls(path: str | Path) -> list[list[list[str]]]:
+    """The calls of the alias records at path (<path>.aliases and the ranks' <path>.aliases.<rank>), each
+    the fields of its lines: in a file, every call's lines end in an empty line; a call that reported nothing is that
+    empty line alone."""
     file = Path(f"{path}.aliases")
-    if not file.is_file():
-        return []
-    calls: list[set[tuple[str, int, str]]] = [set()]
-    for line in file.read_text().splitlines():
-        fields = line.split()
-        if not fields:
-            if calls[-1]:
-                calls.append(set())
+    calls: list[list[list[str]]] = []
+    for f in [file, *sorted(file.parent.glob(file.name + ".*"))]:
+        if not f.is_file():
             continue
-        if len(fields) == 4 and fields[0] == "alias":
-            calls[-1].add((fields[1], int(fields[2]), fields[3]))
+        current: list[list[str]] = []
+        for line in f.read_text().splitlines():
+            if line.strip():
+                current.append(line.split())
+            else:
+                calls.append(current)
+                current = []
+        if current:
+            calls.append(current)
+    return calls
+
+
+def recorded_aliases(path: str | Path) -> list[tuple[str, int, str]]:
+    """The (image, element, array) aliases every call recorded at path reported (<path>.aliases, or the
+    ranks' <path>.aliases.<rank>, written by the alias record of a sizing run: the member of element of the
+    array of records image is the SDFG image of IS the array array); empty without the files."""
+    calls = [{(f[1], int(f[2]), f[3]) for f in call if len(f) == 4 and f[0] == "alias"} for call in _alias_calls(path)]
     calls = [c for c in calls if c]
-    if not calls:
-        return []
-    return sorted(set.intersection(*calls))
+    return sorted(set.intersection(*calls)) if calls else []
 
 
 def recorded_member_aliases(path: str | Path) -> list[tuple[str, int, str, int]]:
-    """The ``(image, element, other image, other element)`` member aliases the calls recorded at ``path`` reported
-    (``same`` lines of ``<path>.aliases``: the member of ``element`` of the records ``image`` is the SDFG image of
-    is that of ``other element`` of ``other image``), when every call reported the same ones; empty otherwise, and
+    """The (image, element, other image, other element) member aliases the calls recorded at path reported
+    (same lines of <path>.aliases: the member of element of the records image is the SDFG image of
+    is that of other element of other image), when every call reported the same ones; empty otherwise, and
     without the file. (Folding an alias some call did not have would be as wrong as missing one another call had.)"""
-    file = Path(f"{path}.aliases")
-    if not file.is_file():
-        return []
-    calls: list[set[tuple[str, int, str, int]]] = [set()]
-    for line in file.read_text().splitlines():
-        fields = line.split()
-        if not fields:
-            calls.append(set())
-            continue
-        if len(fields) == 5 and fields[0] == "same":
-            calls[-1].add((fields[1], int(fields[2]), fields[3], int(fields[4])))
-    calls = calls[:-1] if not calls[-1] else calls  # the empty line that ends the last call
+    calls = [{(f[1], int(f[2]), f[3], int(f[4])) for f in call if len(f) == 5 and f[0] == "same"}
+             for call in _alias_calls(path)]
     if not calls or any(c != calls[0] for c in calls):
         return []
     return sorted(calls[0])
+
+
+def recorded_present_members(path: str | Path) -> set[tuple[str, int]]:
+    """The (image, element) members the alias record at path lists as present in every call (member
+    lines of <path>.aliases); empty without the file, or with a record written before those lines existed."""
+    calls = [{(f[1], int(f[2])) for f in call if len(f) == 3 and f[0] == "member"} for call in _alias_calls(path)]
+    calls = [c for c in calls if c]
+    return set.intersection(*calls) if calls else set()
 
 
 def _recorded_values(path: str | Path) -> dict[str, set[Value]]:

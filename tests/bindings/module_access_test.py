@@ -8,9 +8,11 @@ import pytest
 
 from dace_fortran.bindings.module_access import (
     ModuleAccessError,
+    ReleaseSpec,
     changed_global_data_symbols,
     expose_module_variables,
     public_variables,
+    shrink_allocations,
 )
 
 # The declaration forms a large code base uses for module state: several entities per statement, attribute lists with
@@ -58,7 +60,7 @@ end module owner
 
 
 def test_accessors_are_appended_and_the_declarations_kept():
-    copy, exposed = expose_module_variables(_OWNER, "owner", ["state_b", "states", "RIGHT", "view"])
+    copy, exposed, _ = expose_module_variables(_OWNER, "owner", ["state_b", "states", "RIGHT", "view"])
     for line in _OWNER.splitlines():
         assert line in copy.splitlines()  # nothing of the original changes
     assert "    target :: state_b, states, right" in copy  # the pointer needs no target attribute
@@ -146,7 +148,7 @@ def test_the_copy_links_in_place_of_the_original_object(tmp_path: Path):
     _compile("gfortran", orig / "owner.f90", orig / "owner.o", orig)
     _compile("gfortran", orig / "user.f90", orig / "user.o", orig)  # another object, built against the original
 
-    source, _ = expose_module_variables(_OWNER, "owner", ["state_b", "left"])
+    source, _, _ = expose_module_variables(_OWNER, "owner", ["state_b", "left"])
     (copy / "owner.f90").write_text(source)
     (copy / "binding.f90").write_text(_BINDING)
     _compile("gfortran", copy / "owner.f90", copy / "owner.o", copy)
@@ -169,3 +171,47 @@ def test_a_changed_data_layout_is_reported(tmp_path: Path):
     _compile("gfortran", a / "m.f90", a / "m.o", a)
     _compile("gfortran", b / "m.f90", b / "m.o", b)
     assert changed_global_data_symbols(a / "m.o", b / "m.o") == ["__m_MOD_table"]
+
+
+# Allocations of work arrays as a large code base writes them: several objects in one statement with bounds that hold
+# commas inside parentheses, an array of records' members in a loop, and an option after the objects.
+_ALLOCATIONS = """
+module work
+    implicit none
+    type scalar_field
+        real(8), pointer :: sf(:, :, :) => null()
+    end type scalar_field
+    type vector_field
+        type(scalar_field), allocatable :: vf(:)
+    end type vector_field
+    integer :: m = 4, n = 3, p = 2, nv = 5, ierr
+    real(8), allocatable :: a1(:, :, :), a10(:, :, :), b(:, :, :, :)
+    type(vector_field), allocatable :: flux(:)
+contains
+    subroutine initialise()
+        integer :: i, l
+        allocate (a1(0:m, 0:n, 0:p), a10(0:m, 0:n, 0:p), b(lbound(a1, 1):ubound(a1, 1), 0:n, 0:p, 1:nv))
+        allocate (flux(1:3))
+        do i = 1, 3
+            allocate (flux(i)%vf(1:nv))
+            do l = 1, nv
+                allocate (flux(i)%vf(l)%sf(0:m, 0:n, 0:p), stat=ierr)
+            end do
+        end do
+    end subroutine initialise
+end module work
+"""
+
+
+def test_allocations_shrink_per_object_of_a_statement(tmp_path: Path):
+    source, changed = shrink_allocations(_ALLOCATIONS, ReleaseSpec("a1"))
+    assert changed == 1
+    assert "allocate (a1(1, 1, 1), a10(0:m, 0:n, 0:p), b(lbound(a1, 1):ubound(a1, 1), 0:n, 0:p, 1:nv))" in source
+    source, changed = shrink_allocations(source, ReleaseSpec("b"))
+    assert changed == 1 and " b(1, 1, 1, 1))" in source
+    source, changed = shrink_allocations(source, ReleaseSpec("flux", (("vf", 1, False), ("sf", 3, True))))
+    assert changed == 1 and "allocate (flux(i)%vf(l)%sf(1, 1, 1), stat=ierr)" in source
+    assert "allocate (flux(i)%vf(1:nv))" in source
+    assert shrink_allocations(source, ReleaseSpec("missing")) == (source, 0)
+    (tmp_path / "work.f90").write_text(source)
+    subprocess.run(["gfortran", "-c", "work.f90"], cwd=tmp_path, check=True)

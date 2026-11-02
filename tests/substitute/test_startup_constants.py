@@ -77,13 +77,13 @@ end program p_main
 """
 
 
-def _analysis(tmp_path, main=_MAIN) -> StartupAnalysis:
+def _analysis(tmp_path, main=_MAIN, runtime=frozenset()) -> StartupAnalysis:
     paths = []
     for name, text in {"m_params.f90": _PARAMS, "m_rhs.f90": _RHS, "m_time.f90": _TIME, "p_main.f90": main}.items():
         path = tmp_path / name
         path.write_text(text)
         paths.append(path)
-    return StartupAnalysis(parse_sources(paths), ("m_rhs", "s_rhs"))
+    return StartupAnalysis(parse_sources(paths), ("m_rhs", "s_rhs"), runtime=runtime)
 
 
 def test_values_set_only_before_the_time_loop_keep_their_value(tmp_path):
@@ -91,6 +91,13 @@ def test_values_set_only_before_the_time_loop_keep_their_value(tmp_path):
     assert a.main is not None and a.main.name == "p_main"
     for name in ("n_steps", "gamma", "flags", "set_once", "shown"):  # read, assigned or set up before the loop
         assert a.changes(("m_params", name)) == [], name
+
+
+def test_runtime_values_count_as_changed(tmp_path):
+    a = _analysis(tmp_path, runtime=frozenset({("m_params", "n_steps")}))
+    assert a.changes(("m_params", "n_steps")) == ["read on every call (runtime)"]  # set before the loop, but named
+    assert a.changes(("m_params", "n_steps"), shape=True) == []
+    assert a.changes(("m_params", "gamma")) == []
 
 
 def test_values_code_may_change_after_the_first_call(tmp_path):

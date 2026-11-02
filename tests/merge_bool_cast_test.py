@@ -52,7 +52,7 @@ def test_a_merge_of_specialised_one_and_zero_stays_an_integer(tmp_path):
 
 def test_a_merge_of_a_constant_and_zero_as_a_loop_bound_stays_a_merge(tmp_path):
     """Specialised to 2 and 0 the merge stays a select, ``select(i == 1, 2, 0)``: not the extent clamp
-    ``select(x > 0, x, 0)`` it resembles, so the bound is not the constant 2 -- the loop of i = 2 has no trips (as MFC's
+    ``select(x > 0, x, 0)`` it resembles, so the bound is not the constant 2 -- the loop of i = 2 has no trips (as for
     interface Reynolds numbers with shear but no bulk viscosity, whose second row of indices is never set)."""
     hlfir = compile_to_hlfir(_SRC, tmp_path / "hlfir", name="sizes_work")
     sdfg = SDFGBuilder(str(hlfir), entry="sizes_work::pick_sum",

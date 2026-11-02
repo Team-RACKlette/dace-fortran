@@ -705,13 +705,28 @@ def forward_copy(sdfg: dace.SDFG, scratch: str, real: str, reads: bool, known: d
         if found is None:
             raise LookupError(f"{scratch}: no copy {'after' if writes else 'before'} state {state.label}")
         relations[state] = relations[found]
+    # The copies order a state's nodes (a writer of the scratch before the copy, the copy before a reader of the real
+    # array). Once they are gone, the orders between the two arrays' nodes they held are put back as empty edges:
+    # left unordered, the writer and the reader were two nodes of the real array in no order, and a writer no read
+    # followed was a dead write to the simplification, which removed it (a nested body's output then became a
+    # transient of its own, allocated per thread).
+    orders = {st: _orders(st, scratch, real) for st in relations}
     for state, group in by_state.items():
         for st, entry, tasklet in group:
             _remove_copy(st, entry, tasklet)
     for st, mapping in relations.items():
         _rewrite_state(sdfg, st, scratch, real, mapping)
+        for a, b in orders[st]:
+            if a in st.nodes() and b in st.nodes() and not nx.has_path(st.nx, a, b):
+                st.add_nedge(a, b, dace.Memlet())
     del sdfg.arrays[scratch]
     return len(copies)
+
+
+def _orders(st: dace.SDFGState, scratch: str, real: str) -> list[tuple]:
+    """Every ordered pair (a runs before b) among the access nodes of ``scratch`` and ``real`` in ``st``."""
+    acc = [n for n in st.nodes() if isinstance(n, nodes.AccessNode) and n.data in (scratch, real)]
+    return [(a, b) for a in acc for b in acc if a is not b and nx.has_path(st.nx, a, b)]
 
 
 def _rewrite_state(sdfg: dace.SDFG, st: dace.SDFGState, scratch: str, real: str, mapping) -> None:
@@ -740,8 +755,6 @@ def _rewrite_state(sdfg: dace.SDFG, st: dace.SDFGState, scratch: str, real: str,
         if e.data.data == scratch:
             e.data.data = real
             e.data.subset = _remap_subset(e.data.subset, full_scratch, real_desc, mapping)
-    import networkx as nx  # noqa: PLC0415
-
     for node in renamed:
         if not st.out_degree(node):
             continue

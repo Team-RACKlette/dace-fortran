@@ -45,6 +45,7 @@ from dace.transformation.passes.persistent_transients import MakeTransientsPersi
 from dace_fortran.bindings import FlattenPlan, emit_bindings
 from dace_fortran.bindings.acc_transfers import plan_device_resident_caller
 from dace_fortran.bindings.block_builders import unsourced_array_args
+from dace_fortran.substitute.derive_records import runtime_names
 from dace_fortran.bindings.build_fortran_library import compiled_init_symbols
 from dace_fortran.bindings.fortran_interface import build_auto_interface
 from dace_fortran.bindings.frozen_signature import attach_to_sdfg, drop_unread_module_inputs, get_frozen_signature, refreeze
@@ -1525,7 +1526,8 @@ def main() -> int:
     ap.add_argument("--runtime", action="append", default=[], metavar="MODULE::VARIABLE",
                     help="with --startup-constants: a module variable the substitute reads on every call instead of "
                     "being specialised to its recorded value, though no code changes it after the first call: one "
-                    "that differs from one run to the next, such as the steps a run starts and stops at (repeatable)")
+                    "that differs from one run to the next, such as the steps a run starts and stops at (repeatable); "
+                    "never one of the per-rank value sets the guard checks either")
     ap.add_argument("--symbolic", type=Path, metavar="FILE",
                     help="with --specialize: recorded names (one per line, # comments) the build leaves symbolic: not "
                     "baked, not guarded, the binding passes each call's value; the scratch analysis and the alias "
@@ -1642,10 +1644,13 @@ def main() -> int:
     if arrays:
         print(f"specialised to the elements of small module arrays: {arrays}", flush=True)
     # The recorded values that differ between the ranks of a run: known sets, not baked (the names the guard could
-    # check, like the baked ones).
+    # check, like the baked ones). A value read on every call (--runtime) is no set either: a coefficient set once
+    # from the cell size differs between the ranks by rounding alone, and records derived for another grid
+    # (derive_records) hold the recorded grid's values of it, which no call at the target grid gives.
+    runtime_keys = runtime_names(args.runtime)
     value_sets_all = {name: v for name, v in recorded_value_sets(args.specialize).items()
                       if name in specializable(general, iface, plan)} if args.specialize else {}
-    value_sets = {name: v for name, v in value_sets_all.items() if name not in symbolic}
+    value_sets = {name: v for name, v in value_sets_all.items() if name not in symbolic and name not in runtime_keys}
     # Each rank's combination of them: the binding admits these only, so the build may rely on them.
     rank_values = [{n: r[n] for n in value_sets} for r in recorded_rank_values(args.specialize)] if value_sets else []
     rank_values_all = [{n: r[n] for n in value_sets_all} for r in recorded_rank_values(args.specialize)] \

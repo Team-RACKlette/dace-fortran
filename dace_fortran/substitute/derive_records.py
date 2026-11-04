@@ -30,11 +30,19 @@ import json
 import re
 import shutil
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 
 class DerivationError(ValueError):
     """The records of A and B do not determine the target's."""
+
+
+def runtime_names(runtime: Iterable[str]) -> frozenset[str]:
+    """The values a build reads on every call (``--runtime``, ``module::name``) as a record may name them: lower-case,
+    and the bare ``name`` with each (a record of the binding's symbols and scalar inputs names a module variable so)."""
+    names = {n.lower() for n in runtime}
+    return frozenset(names | {n.rsplit("::", 1)[-1] for n in names})
 
 
 def _calls(text: str) -> list[list[tuple[str, str]]]:
@@ -119,8 +127,7 @@ def derive(a: Path, b: Path, out: Path, drivers: dict, overrides: dict[str, str]
     """
     overrides = overrides or {}
     overrides = {**{n.rsplit("::", 1)[-1]: v for n, v in overrides.items()}, **overrides}
-    runtime = frozenset(n.lower() for n in runtime)
-    runtime |= {n.rsplit("::", 1)[-1] for n in runtime}
+    runtime = runtime_names(runtime)
     ranks = len(drivers["target"])
     if not (len(drivers["a"]) == len(drivers["b"]) == ranks):
         raise DerivationError("the drivers name a different number of ranks at A, B and the target")

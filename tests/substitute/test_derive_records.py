@@ -130,3 +130,10 @@ def test_two_drivers_fitting_must_agree_at_the_target(tmp_path: Path):
     assert "q_d1 108\n" in (tmp_path / "t" / "r").read_text()
     with pytest.raises(DerivationError, match="several drivers"):
         derive(tmp_path / "a" / "r", tmp_path / "b" / "r", tmp_path / "t2" / "r", {"a": drv(39, 39), "b": drv(19, 19), "target": drv(99, 59)})
+
+
+def test_runtime_names_cover_the_bare_name_too():
+    from dace_fortran.substitute.derive_records import runtime_names
+
+    assert runtime_names(["M_IGR::Alf_igr", "t_stop"]) == frozenset({"m_igr::alf_igr", "alf_igr", "t_stop"})
+    assert runtime_names([]) == frozenset()
